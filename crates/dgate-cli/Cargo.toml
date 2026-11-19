@@ -1,0 +1,34 @@
+[package]
+name = "dgate-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "dgate v2 native `dg`/`dgate` CLI — route/gate/wrap dispatcher with detached-process-group watchdog"
+
+[lib]
+name = "dgate_cli"
+path = "src/lib.rs"
+
+# 듀얼 바이너리는 각각 자체 파일을 가진다 — 같은 path를 공유하면 cargo가
+# "file found to be present in multiple build targets" 경고를 낸다.
+# 두 bin 모두 공유 lib(dgate_cli)의 run()만 호출한다.
+
+[dependencies]
+dgate-core = { path = "../dgate-core" }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+libc = "0.2"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+sha2 = "0.10"
+
+[[bin]]
+name = "dg"
+path = "src/bin/dg.rs"
+
+[[bin]]
+name = "dgate"
+path = "src/bin/dgate.rs"

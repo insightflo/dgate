@@ -23,7 +23,11 @@
     "setup": "node ./scripts/setup.ts",
     "setup:check": "node ./scripts/setup.ts --check",
     "dg": "node ./src/decision/dg.ts",
-    "orchestrate:dry": "node ./scripts/herdr-quad-launch.ts --mode orchestrate --dry-run"
+    "orchestrate:dry": "node ./scripts/herdr-quad-launch.ts --mode orchestrate --dry-run",
+    "rust:build": "cargo build --release",
+    "rust:test": "cargo test",
+    "gui:build": "cargo build -p dgate-gui",
+    "gui:run": "cargo run -p dgate-gui --"
   },
   "engines": {
     "node": ">=22.6.0"

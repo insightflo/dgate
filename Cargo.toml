@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/dgate-core", "crates/dgate-cli", "crates/dgate-gui"]
+default-members = ["crates/dgate-core", "crates/dgate-cli"]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/insightflo/dgate"

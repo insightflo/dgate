@@ -1,0 +1,19 @@
+//! 명령별 구현 모듈 — lib.rs의 run()이 라우팅한다.
+pub mod attempt;
+pub mod backprop;
+pub mod checkpoint;
+pub mod close;
+pub mod compact;
+pub mod dispatch;
+pub mod gate;
+pub mod hook;
+pub mod record;
+pub mod report;
+pub mod retro;
+pub mod route;
+pub mod settle_orphans;
+pub mod setup;
+pub mod stats;
+pub mod touch;
+pub mod wrap;
+pub mod worktree;

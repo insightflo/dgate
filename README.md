@@ -8,6 +8,8 @@
 
 결정 엔진은 SQLite(WAL) 위에 EWMA Beta 사후확률을 유지하고, **동일 조건 연속 오류 2회 시 강제 `split`**(리드 승격)으로 안전하게 폴백한다. 외부 npm 의존성은 0개 — Node.js 내장 모듈만으로 동작한다.
 
+> **Rust v2 네이티브 CLI & GPUI 데스크톱 앱** — 같은 SQLite DB·roster.json을 공유하는 네이티브 구현이 Cargo 워크스페이스(`crates/dgate-core`·`crates/dgate-cli`)로 준비돼 있다. `cargo build --release` 한 번으로 `target/release/dg`·`dgate` 네이티브 바이너리(~3.7ms 기동, Node 대비 약 24배 빠름)를 얻고, 선택적으로 `cargo build -p dgate-gui`로 GPUI 데스크톱 관제앱도 띄울 수 있다. 자세한 것은 [§7](#7-rust-v2-네이티브-cli--선택적-gpui-데스크톱-관제앱).
+
 ---
 
 ## 1. 아키텍처 요약 (Pre-Lead Gate + 5계층)
@@ -267,6 +269,53 @@ agy --output-format stream-json --print "…" | node ./src/cli.ts --stream   # J
 ```
 
 주요 조작: `Tab` 패널 포커스 이동 · `Enter` 상세 모달 · `r` 응답 전문 · `s`/`n`/`c` 스웜·검증·자문 모달 · `/` 프롬프트 입력 · `?` 도움말. JSONL 스트림 프로토콜은 [examples/sample-session.jsonl](examples/sample-session.jsonl) 참고.
+
+---
+
+## 7. Rust v2 네이티브 CLI & 선택적 GPUI 데스크톱 관제앱
+
+Node v1과 **동일한 SQLite DB·`roster.json`을 완전 공유**하는 Rust v2 구현. Cargo 워크스페이스로 코어·CLI·GUI가 크레이트 단위로 분리돼 있다.
+
+### Cargo 워크스페이스 분리 — CLI는 GUI 컴파일 무게 0
+
+```toml
+default-members = ["crates/dgate-core", "crates/dgate-cli"]
+```
+
+- **CLI/헤드리스 빌드는 GUI 의존성을 전혀 컴파일하지 않는다.** `dgate-gui`는 별도 opt-in 멤버다.
+- `cargo build --release` → 네이티브 `target/release/dg` · `target/release/dgate` 바이너리 생성.
+- **~3.7ms 기동 / Node 대비 약 24배 빠름** — 콜드스타트가 중요한 래핑·통계·루팅 호출에 유리하다.
+- **SQLite DDL v2 100% 호환** — Node v1이 만든 `decision.db`를 그대로 읽고 쓴다. 마이그레이션·변환 없이 v1↔v2 혼용 가능.
+- 편의 스크립트: `npm run rust:build` / `npm run rust:test` (npm 의존성은 여전히 0개).
+
+### 선택적 GPUI 네이티브 데스크톱 관제앱 (`crates/dgate-gui`)
+
+[gpui 0.2.2](https://github.com/longbridge/gpui) 기반 · Metal GPU 가속 네이티브 데스크톱 앱. 완전 선택 사항이다:
+
+```bash
+npm run gui:build    # = cargo build -p dgate-gui
+npm run gui:run      # = cargo run -p dgate-gui --
+# 또는 직접:
+cargo run -p dgate-gui -- [--repo <dir>] [--db <path>] [--roster <path>] [--watch-only] [--poll-ms 2000]
+```
+
+하이라이트:
+
+- **저장소별 탭** — 여러 `[--repo]`를 한 창에서 전환하며 관제
+- **5-역할 로스터 카드** — lead·explore·coder·verifier·advisor 바인딩·모델 한눈에
+- **hc 워커 실시간 활동** — 활성 워커당 1줄 리덕션(민감정보 마스킹) 스트림
+- **Decision Gate 확률 바 + 비용/타이밍/shadow 요약** — `dg stats`/`report` 데이터를 시각화
+- **2단계 명시 확인 워커 정지** — 안전한 worker stop(실수 방지 이중 확인)
+- **조용한 대기 상태** — 유휴 시 과잉 애니메이션 없는 차분한 화면
+
+### Node v1 ↔ Rust v2 테스트·호환성
+
+| 구현 | 테스트 | 비고 |
+| :--- | :--- | :--- |
+| Node v1 | 171건 | `npm test` — 외부 의존성 0개 |
+| Rust v2 | 274건 (core 248 + cli/교차호환 9 + gui 17) | `cargo test` — 동일 SQLite DB·`roster.json` SSOT 공유 |
+
+두 구현은 **정확히 같은 SQLite DB와 `roster.json`**을 쓰므로 어떤 CLI로 기록해도 다른 쪽에서 그대로 읽힌다.
 
 ---
 

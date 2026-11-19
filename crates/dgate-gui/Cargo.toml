@@ -1,0 +1,17 @@
+[package]
+name = "dgate-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "dgate-gui"
+path = "src/main.rs"
+
+[dependencies]
+dgate-core = { path = "../dgate-core" }
+gpui = "0.2.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+libc = "0.2"
