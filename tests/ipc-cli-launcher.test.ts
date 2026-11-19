@@ -17,7 +17,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { test } from 'node:test';
-import { openDb, resolveProjectIdentity } from '../src/decision/db.ts';
+import { bumpAgyBudget, openDb, resolveProjectIdentity } from '../src/decision/db.ts';
 import { createDemoController, executePromptCommand } from '../src/state/demoEngine.ts';
 import { createInitialState } from '../src/state/store.ts';
 import {
@@ -245,10 +245,7 @@ test('7. launcher: agy-quad dry-run + agy_budget 강등', () => {
     const budgetDb = path.join(e.base, 'budget.db');
     const db = openDb(budgetDb);
     try {
-      db.prepare('INSERT INTO agy_budget (day, turns_used, sessions_started, updated_at_ms) VALUES (?, 25, 3, ?)').run(
-        new Date().toISOString().slice(0, 10),
-        Date.now()
-      );
+      bumpAgyBudget(db, { turns: 25, sessions: 3 });
     } finally {
       db.close();
     }

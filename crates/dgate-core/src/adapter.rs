@@ -694,7 +694,12 @@ mod tests {
             let thread = std::thread::spawn(move || {
                 while !stop_clone.load(Ordering::Relaxed) {
                     match listener.accept() {
-                        Ok((stream, _)) => handle_conn(stream, &handler, &requests_for_thread),
+                        Ok((stream, _)) => {
+                            // macOS(BSD 소켓): nonblocking 리스너에서 accept된 스트림은
+                            // O_NONBLOCK을 상속한다. 명시적으로 블로킹 모드로 되돌린다.
+                            let _ = stream.set_nonblocking(false);
+                            handle_conn(stream, &handler, &requests_for_thread);
+                        }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(std::time::Duration::from_millis(3));
                         }
@@ -736,6 +741,12 @@ mod tests {
             match stream.read(&mut chunk) {
                 Ok(0) => return,
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::Interrupted
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    continue; // read timeout(5s)이 걸린 블로킹 소켓이므로 재시도
+                }
                 Err(_) => return,
             }
             if buf.len() > 1024 * 1024 {
@@ -764,6 +775,12 @@ mod tests {
             match stream.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::Interrupted
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    continue;
+                }
                 Err(_) => break,
             }
         }
@@ -792,8 +809,9 @@ mod tests {
             payload.len(),
             payload
         );
-        let _ = stream.write_all(response.as_bytes());
-        let _ = stream.flush();
+        if stream.write_all(response.as_bytes()).is_ok() {
+            let _ = stream.flush();
+        }
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
 
