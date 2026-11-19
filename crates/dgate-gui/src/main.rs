@@ -1,8 +1,8 @@
 //! dgate-gui 진입점 — CLI 파싱 후 GPUI Metal 창을 연다 (Rust v2 Wave 2B).
 //!
-//! 목적: `--help`면 도움말 출력 후 exit 0(창 없음). 그 외에는 1180×760 중앙
+//! 목적: `--help`면 도움말 출력 후 exit 0(창 없음). 그 외에는 1280×860 중앙
 //! 네이티브 창 "dgate — Native Control & Monitor (GPUI)" 를 열고 백그라운드
-//! 폴러 + 대시보드 뷰를 띄운다.
+//! 폴러 + 대시보드 뷰를 띄운다. 최소 크기 640×480 — 자유 리사이즈 가능.
 //!
 //! 외부 연결:
 //! - `state::parse_gui_cli_options` / `spawn_poller` — 옵션·폴링 스레드.
@@ -41,17 +41,17 @@ fn main() {
     let (poller, join) = state::spawn_poller(cfg);
 
     Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1280.0), px(860.0)), cx);
         let options = opts.clone();
         let view_poller = poller.clone();
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("dgate — Native Control & Monitor (GPUI)".into()),
+                    title: Some("dgate — TUI 5-Layer Flow Topology (GPUI)".into()),
                     ..Default::default()
                 }),
-                window_min_size: Some(size(px(1080.0), px(680.0))),
+                window_min_size: Some(size(px(640.0), px(480.0))),
                 ..Default::default()
             },
             |_, cx| cx.new(|cx| view::DashboardView::new(&options, view_poller.clone(), cx)),

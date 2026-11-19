@@ -2,6 +2,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as tty from 'node:tty';
+import { fileURLToPath } from 'node:url';
 import {
   AgentRunner,
   type BackendPreference,
@@ -38,7 +39,7 @@ import {
   attachStdinStream,
   parseJsonLine,
 } from './state/streamAdapter.ts';
-import type { CompactTab, EffortLevel, ModalKind, QuadRole, RunMode } from './types.ts';
+import type { AppState, CompactTab, EffortLevel, ModalKind, QuadRole, RunMode } from './types.ts';
 import { computeLayout } from './ui/layout.ts';
 import { renderFrame } from './ui/renderApp.ts';
 import { renderQuadRoleFrame } from './ui/renderQuadRole.ts';
@@ -290,6 +291,89 @@ DGATE TUI (Lead · Decision Gate · Workers · Verifier · Advisor)
   console.log(usage);
 }
 
+/** 라이브 역할 패널 동기화 추적 — 이 동기화가 덮어쓴 패널만 종료 시 깨끗하게 복귀시킨다. */
+export interface LiveRolePanelTrail {
+  phaseSet: boolean;
+  /** false=미설정, 'run'=실행 중, 'pass'=완료 표시 중(소멸 시 idle 복귀 대기) */
+  neonSet: boolean | 'run' | 'pass';
+  advisorSet: boolean;
+}
+
+export function createLiveRoleTrail(): LiveRolePanelTrail {
+  return { phaseSet: false, neonSet: false, advisorSet: false };
+}
+
+/**
+ * Live 로스터 동기화 시 `merged.workers` 슬롯을 Lead/Verifier/Advisor 역할 패널에 반영한다.
+ * - verifier 실행 → neonState='run'(부재 진행률 0 — 렌더에서 활성 바) + 1줄 활동 라벨
+ * - advisor 실행 → advisorState='자문 중' + activeTrigger=0 (Advisor→Lead 와이어 펄스)
+ * - lead 실행 → phase='작업 중', 그 외 워커 실행 → phase='워커 실행 중'(Lead 패널·와이어 펄스)
+ * - 전부 종료 → 이 함수가 설정한 값만 '대기 중'/'idle'로 복귀(침착 대기 불변식 유지).
+ * 트랜스크립트 매퍼가 쓰는 state.cards 3슬롯은 건드리지 않는다.
+ */
+export function applyLiveRolePanels(
+  state: AppState,
+  merged: MergedLiveRoster,
+  trail: LiveRolePanelTrail
+): void {
+  const active = merged.workers.filter((w) => w.status !== 'done');
+
+  // Verifier → 교차 검증(neon) 패널
+  const verifier = active.find((w) => w.slot === 'verifier');
+  if (verifier) {
+    trail.neonSet = 'run';
+    state.neonState = 'run';
+    state.neonProgress = 0;
+    state.neonLabel = `[${verifier.repoTag}] ${verifier.name}: ${verifier.activity}`;
+  } else if (trail.neonSet === 'run') {
+    // 실행 중이던 verifier가 완료로 남아 있으면 잠깐 'pass', 목록에서 사라지면 'idle' 복귀
+    const verifierDone = merged.workers.some((w) => w.slot === 'verifier');
+    if (verifierDone) {
+      trail.neonSet = 'pass';
+      state.neonState = 'pass';
+      state.neonProgress = 100;
+      state.neonVerified += 1;
+    } else {
+      trail.neonSet = false;
+      state.neonState = 'idle';
+      state.neonProgress = 0;
+    }
+    state.neonLabel = '';
+  } else if (trail.neonSet === 'pass' && !merged.workers.some((w) => w.slot === 'verifier')) {
+    // 'pass' 표시 중 verifier가 목록에서 사라지면 'idle' 복귀
+    trail.neonSet = false;
+    state.neonState = 'idle';
+    state.neonProgress = 0;
+    state.neonLabel = '';
+  }
+
+  // Advisor → 자문 패널 (트리거 0번 라인 활성 — Advisor→Lead 와이어 펄스)
+  const advisor = active.find((w) => w.slot === 'advisor');
+  if (advisor) {
+    trail.advisorSet = true;
+    state.advisorState = '자문 중';
+    state.activeTrigger = 0;
+    state.latestAdvice = advisor.activity;
+  } else if (trail.advisorSet) {
+    trail.advisorSet = false;
+    state.advisorState = '대기 중';
+    state.activeTrigger = -1;
+  }
+
+  // Lead → 위상 배지 (Lead 패널·Lead→Decision 와이어 펄스)
+  const lead = active.find((w) => w.slot === 'lead');
+  if (lead) {
+    trail.phaseSet = true;
+    state.phase = '작업 중';
+  } else if (active.length > 0) {
+    trail.phaseSet = true;
+    state.phase = '워커 실행 중';
+  } else if (trail.phaseSet) {
+    trail.phaseSet = false;
+    state.phase = '대기 중';
+  }
+}
+
 function main(): void {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.showHelp) {
@@ -504,6 +588,8 @@ function main(): void {
       slot: LiveWorkerInfo['slot'];
     }
   >();
+  // 역할 패널 동기화가 덮어쓴 영역 추적 — 종료 복귀 판정에 사용
+  const liveRoleTrail = createLiveRoleTrail();
 
   const liveRosterStateSignature = (): string =>
     JSON.stringify([
@@ -552,6 +638,9 @@ function main(): void {
       status: w.status === 'done' ? ('done' as const) : ('running' as const),
     }));
     state.swarmActive = merged.activeWorkerCount;
+
+    // 역할 패널(Lead/Verifier/Advisor) 라이브 활성화 — 워커 종료 시 깨끗한 대기 복귀
+    applyLiveRolePanels(state, merged, liveRoleTrail);
 
     // 워커 매트릭스(s 모달) 앞 슬롯에도 live 상태 반영
     for (let i = 0; i < state.workers.length; i++) {
@@ -991,4 +1080,10 @@ function main(): void {
   renderNow();
 }
 
-main();
+// 모듈 테스트 임포트 시 main()이 실행되지 않도록 직접 실행(entry)일 때만 구동한다.
+// entryPath가 없으면(node -e 등) 절대 구동하지 않는다.
+const entryPath = process.argv[1] ? path.resolve(process.argv[1]) : null;
+if (entryPath && entryPath === fileURLToPath(import.meta.url)) {
+  main();
+}
+

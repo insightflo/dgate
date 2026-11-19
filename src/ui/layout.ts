@@ -21,7 +21,8 @@ export interface FullLayout {
   readonly decision: Rect;
   readonly delegateLabelY: number;
   readonly fanOutY: number;
-  readonly cards: readonly [Rect, Rect, Rect];
+  /** 실제 렌더링되는 워커 카드 수(1..maxCardSlots) — 중심축 centerX 기준 정렬 */
+  readonly cards: readonly Rect[];
   readonly fanInY: number;
   readonly back: Rect;
 
@@ -41,7 +42,26 @@ export interface CompactLayout {
 
 export type ComputedLayout = FullLayout | CompactLayout;
 
-export function computeLayout(cols: number, rows: number): ComputedLayout {
+/** 전체 레이아웃 파이프라인 영역 폭 — 카드 슬롯 상한 산정과 computeLayout이 공유. */
+export function pipelineWidthFor(cols: number): number {
+  return pipelineMetricsFor(cols).pipeW;
+}
+
+function pipelineMetricsFor(cols: number): { padX: number; pipeX: number; pipeW: number; advisorW: number } {
+  const padX = cols >= 136 ? 2 : 1;
+  const advisorW = cols >= 142 ? 36 : cols >= 122 ? 32 : 28;
+  const bridgeMin = cols >= 142 ? 6 : cols >= 122 ? 5 : 3;
+  const pipeX = padX + advisorW + bridgeMin;
+  return { padX, pipeX, pipeW: Math.max(58, cols - padX - pipeX), advisorW };
+}
+
+/** 현재 폭에서 렌더링 가능한 워커 카드 최대 슬롯 수 — 파이프 폭 기반 2~4개. */
+export function maxCardSlotsFor(cols: number): number {
+  const pipeW = pipelineWidthFor(cols);
+  return pipeW >= 92 ? 4 : pipeW >= 68 ? 3 : 2;
+}
+
+export function computeLayout(cols: number, rows: number, visibleCardCount = 3): ComputedLayout {
   if (cols < 98 || rows < 30) {
     const headerY = 0;
     const tabBarY = 2;
@@ -95,10 +115,7 @@ export function computeLayout(cols: number, rows: number): ComputedLayout {
   const gap3 = Math.max(1, restAfterGap2 - gap1);
 
   // 좌우 폭 계산
-  const advisorW = cols >= 142 ? 36 : cols >= 122 ? 32 : 28;
-  const bridgeMin = cols >= 142 ? 6 : cols >= 122 ? 5 : 3;
-  const pipeX = padX + advisorW + bridgeMin;
-  const pipeW = Math.max(58, cols - padX - pipeX);
+  const { pipeX, pipeW, advisorW } = pipelineMetricsFor(cols);
   const centerX = pipeX + Math.floor(pipeW / 2);
 
   // 각 패널 X/W 계산 (Lead 메인 중앙 축 대칭 + 우측 Verifier 교차 검증 패널)
@@ -134,15 +151,19 @@ export function computeLayout(cols: number, rows: number): ComputedLayout {
   const decisionY = mainY + mainH + gap1;
 
   const cardsY = decisionY + decisionH + gap2;
-  const cardGap = pipeW >= 96 ? 3 : 2;
+  // 가변 워커 카드 — 실제 보여줄 카드 수만큼(1..maxCardSlots) centerX 중심 정렬.
+  // 3카드일 때 폭/간격 공식은 기존과 동일하게 유지(하위 호환 렌더 동일성).
+  const maxCols = maxCardSlotsFor(cols);
+  const visibleCount = Math.max(1, Math.min(Math.floor(visibleCardCount), maxCols));
+  const cardGap = visibleCount >= 4 ? 2 : pipeW >= 96 ? 3 : 2;
   const maxCardsSpan = Math.min(pipeW, 102);
-  const cardW = Math.floor((maxCardsSpan - cardGap * 2) / 3);
-  const actualCardsSpan = cardW * 3 + cardGap * 2;
+  const cardW = Math.max(18, Math.floor((maxCardsSpan - cardGap * (visibleCount - 1)) / visibleCount));
+  const actualCardsSpan = cardW * visibleCount + cardGap * (visibleCount - 1);
   const cardsStartX = centerX - Math.floor(actualCardsSpan / 2);
-
-  const card0: Rect = { x: cardsStartX, y: cardsY, w: cardW, h: cardH };
-  const card1: Rect = { x: cardsStartX + cardW + cardGap, y: cardsY, w: cardW, h: cardH };
-  const card2: Rect = { x: cardsStartX + (cardW + cardGap) * 2, y: cardsY, w: cardW, h: cardH };
+  const cardRects: Rect[] = [];
+  for (let i = 0; i < visibleCount; i++) {
+    cardRects.push({ x: cardsStartX + (cardW + cardGap) * i, y: cardsY, w: cardW, h: cardH });
+  }
 
   const fanOutY = cardsY - 1;
   const delegateLabelY = gap2 >= 2 ? cardsY - 2 : fanOutY;
@@ -191,7 +212,7 @@ export function computeLayout(cols: number, rows: number): ComputedLayout {
     decision: { x: decisionX, y: decisionY, w: decisionW, h: decisionH },
     delegateLabelY,
     fanOutY,
-    cards: [card0, card1, card2],
+    cards: cardRects,
     fanInY,
     back: { x: backX, y: backY, w: backW, h: backH },
     logs: logsRect,

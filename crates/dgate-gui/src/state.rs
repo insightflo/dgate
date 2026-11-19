@@ -30,13 +30,14 @@ use dgate_core::live_sync::{
     format_role_badge, DefaultHcRunner, HcExecRunner, LiveSyncOptions, LiveSyncSnapshotter,
     LiveWorkerInfo,
 };
+use dgate_core::redact::redact_secrets;
 use dgate_core::report::{generate_rule_candidate_report, DecisionApiShadowSummary, ReportOptions};
 use dgate_core::roster::{
     load_roster_config, resolve_roster_profile, RoleSlot, ROLE_SLOTS,
 };
 use dgate_core::stats::{
-    compute_cost_stats, compute_timing_stats, CostStatsOptions, CostStatsResult, SHARP_FLOOR,
-    TimingStatsOptions, TimingStatsResult,
+    compute_cost_stats, compute_timing_stats, CostByStatus, CostStatsOptions, CostStatsResult,
+    CostTokensSummary, SHARP_FLOOR, TimingStatsOptions, TimingStatsResult,
 };
 use dgate_core::telemetry::{heuristic_prior_routes, read_telemetry_snapshot, TelemetryRoute};
 
@@ -60,6 +61,8 @@ pub struct GuiCliOptions {
     pub roster_path: Option<String>,
     /// `--watch-only` — 제어 잠금(중단 버튼 비활성, 토글도 숨김).
     pub watch_only: bool,
+    /// `--demo` — 기동 시부터 내장 DEMO 토폴로지 미리보기로 표시.
+    pub demo: bool,
     /// `--poll-ms <n>` — 폴링 주기(기본 2000).
     pub poll_ms: u64,
     /// `--help` / `-h` — 도움말 출력 후 종료 요청.
@@ -78,6 +81,7 @@ dgate-gui — 선택적 네이티브 GPUI 관제/제어 데스크톱 앱 (Rust v
   --repo <dir>      관측 스코프 레포 디렉터리 (기본: 전체 레포)
   --roster <path>   roster.json 경로 오버라이드 (기본: herdr-quad 탐색 규칙)
   --watch-only      관측 전용 모드로 기동 — 워커 중단 제어 영구 잠금
+  --demo            기동 시부터 내장 DEMO 토폴로지 미리보기 표시 (LIVE/DEMO 토글로 전환)
   --poll-ms <n>     백그라운드 폴링 주기 밀리초 (기본: 2000)
   --help, -h        이 도움말을 출력하고 종료
 
@@ -118,6 +122,7 @@ pub fn parse_gui_cli_options(args: &[String]) -> Result<GuiCliOptions, String> {
                 }
             }
             "--watch-only" => opts.watch_only = true,
+            "--demo" => opts.demo = true,
             other => {
                 return Err(format!("알 수 없는 옵션입니다: {}", other));
             }
@@ -205,9 +210,115 @@ pub struct DashboardSnapshot {
     pub shadow_summary: Option<DecisionApiShadowSummary>,
     /// 레포 탭별 번들 — 키는 repo_tag.
     pub repo_stats: BTreeMap<String, RepoStatsBundle>,
+    /// 세션 기록 패널에 올릴 최신 결정 이벤트(읽기전용 조회 + 리댁션 적용).
+    pub recent_log: Vec<RecentLogEntry>,
     /// "연결됨" | "DB 없음 (대기)" — 파일 부재에도 절대 죽지 않는다.
     pub db_status: String,
     pub hc_available: bool,
+}
+
+// ---------------------------------------------------------------------------
+// 세션 기록 — decision_events 읽기전용 조회 (TUI 5계층 하단 패널 대응)
+// ---------------------------------------------------------------------------
+
+/// 세션 기록 1줄 — `decision_events` 최신 이벤트를 역할 색 태그와 함께 표시.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentLogEntry {
+    /// HH:MM:SS (로컬 타임존).
+    pub time_hhmmss: String,
+    /// 원본 event source ('hook'·'wrap'·'neon_backprop' …).
+    pub source: String,
+    /// 역할 표시명 — "Decision Gate" | "Worker" | "Verifier" | "Advisor" | "Lead".
+    pub source_role: String,
+    /// 리댁션 적용된 1줄 요약.
+    pub message: String,
+    /// 레포 탭 필터링용 project_id (전역이면 None).
+    pub project_id: Option<String>,
+}
+
+/// 라우트 id → TUI 한국어 라벨(모르는 id는 원문 그대로 — 위장 번역 금지).
+fn route_display_label(route: &str) -> &str {
+    match route {
+        "file_select" => "어느 파일",
+        "tool_select" => "어느 도구",
+        "retry_or_abort" => "재시도 또는 중단",
+        "delegate_swarm" => "스웜 위임",
+        other => other,
+    }
+}
+
+/// 이벤트 source·route → 역할 태그(색은 뷰가 매핑).
+/// Advisor는 decision_events에 기록하지 않으므로 라이브 조회에서는 등장하지 않고,
+/// DEMO 표시용 로그에서만 등장한다.
+pub fn event_source_role(source: &str, route: &str) -> &'static str {
+    if source == "neon_backprop" {
+        "Verifier"
+    } else if route == "delegate_swarm" {
+        "Worker"
+    } else if source == "agy_stream" || source == "transcript" {
+        "Lead"
+    } else {
+        "Decision Gate"
+    }
+}
+
+/// `decision_events` 최신 `limit`건을 읽기전용으로 조회해 세션 기록 줄을 만든다.
+/// 모든 오류(테이블 부재·컬럼 불일치 외래 DB 등)는 빈 벡터로 폴백 — 절대 패닉하지 않는다.
+/// 반드시 `read_only: true`로 연 커넥션만 넣는다(호출 계약 — 이 함수는 쓰기를 하지 않는다).
+pub fn fetch_recent_log(conn: &rusqlite::Connection, limit: usize) -> Vec<RecentLogEntry> {
+    let mut stmt = match conn.prepare(
+        "SELECT created_at_ms, project_id, source, route, tool_name, ok, error_snippet
+         FROM decision_events
+         ORDER BY created_at_ms DESC, event_id DESC
+         LIMIT ?1",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match stmt.query_map([limit as i64], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Option<String>>(6)?,
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for row in rows.flatten() {
+        let (created_ms, project_id, source, route, tool_name, ok, error_snippet) = row;
+        let source_role = event_source_role(&source, &route).to_string();
+        // 리댁션은 절단 이전에 적용(레드시스템 계약) — 잘린 경계의 패턴 누락을 막는다.
+        let mut message = format!(
+            "{} · {} · {}",
+            route_display_label(&route),
+            tool_name,
+            if ok != 0 { "ok" } else { "실패" }
+        );
+        if let Some(snippet) = error_snippet
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let redacted = redact_secrets(snippet);
+            let short: String = redacted.chars().take(64).collect();
+            message.push_str(" — ");
+            message.push_str(&short);
+        }
+        out.push(RecentLogEntry {
+            time_hhmmss: format_local_time_label(created_ms),
+            source,
+            source_role,
+            message: redact_secrets(&message),
+            project_id,
+        });
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -269,8 +380,44 @@ pub fn filter_snapshot_by_repo(snapshot: &DashboardSnapshot, repo: Option<&str>)
         out.cost_summary = bundle.cost.clone();
         out.timing_summary = bundle.timing.clone();
         out.shadow_summary = bundle.shadow.clone();
+        // 세션 기록도 선택 레포의 project_id로 필터링(번들 project_id 미상이면 전체 유지).
+        if let Some(pid) = bundle.project_id.as_deref() {
+            out.recent_log = snapshot
+                .recent_log
+                .iter()
+                .filter(|e| e.project_id.as_deref() == Some(pid))
+                .cloned()
+                .collect();
+        }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// 워커 그리드 열 계산 · 라이브 모션 활동 판정 (순수 함수 — GUI 뷰가 사용)
+// ---------------------------------------------------------------------------
+
+/// 화면에 배치할 워커 카드 열 수(= 커넥터 스템 수).
+/// - 라이브 0 — 3슬롯 청사진 토폴로지 유지(침묵 3스템 와이어와 정렬).
+/// - 1/2/3 — 카드 수와 정확히 같은 수의 스템(매달린 여분 스템 금지).
+/// - 4+ — 최대 4열, 초과 워커는 2행 랩('+M개 추가' 배지로 절대 가리지 않는다).
+pub fn visible_worker_columns(worker_count: usize) -> usize {
+    match worker_count {
+        0 => 3,
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        _ => 4,
+    }
+}
+
+/// 지금 실제로 활동 중인가 — DEMO 모드이거나 done 아닌 live 워커가 하나라도
+/// 있을 때만 true. 라이브 & 실행 0(빈 로스터·전부 완료)은 반드시 false여서
+/// GUI 애니메이션 틱(anim_tick 증가·cx.notify)이 완전히 멈추는 침착 유휴를
+/// 보장한다. 역할 카드(Lead/Verifier/Advisor)의 running은 어차피 live 워커
+/// 존재에서 유도되므로 워커 상태 기준 이 판정 하나로 충분하다.
+pub fn has_active_work(snap: &DashboardSnapshot, demo_mode: bool) -> bool {
+    demo_mode || snap.workers.iter().any(|w| w.status.as_deref() != Some("done"))
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +493,8 @@ pub struct DashboardController {
     pub watch_only: bool,
     /// 관측 전용(false) ↔ 제어 허용(true) — `--watch-only`면 영구 false.
     pub control_enabled: bool,
+    /// LIVE 스냅숏 ↔ 내장 DEMO 토폴로지 미리보기 (`--demo` 시작 시 true).
+    pub demo_mode: bool,
     /// 2단계 확인 진행 중인 워커 주소.
     pub confirm_kill_address: Option<String>,
     /// 사용자에게 보여줄 최근 조작 결과 1줄.
@@ -360,6 +509,7 @@ impl DashboardController {
             paused: false,
             watch_only,
             control_enabled: false,
+            demo_mode: false,
             confirm_kill_address: None,
             last_action_message: None,
         }
@@ -383,7 +533,11 @@ impl DashboardController {
     }
 
     /// 현재 선택 기준 필터링된 뷰 스냅숏(스냅숏 미수신 시 대기 상태 기본값).
+    /// DEMO 모드면 라이브 스냅숏 대신 내장 시뮬레이션 토폴로지를 반환한다.
     pub fn filtered(&self) -> DashboardSnapshot {
+        if self.demo_mode {
+            return demo_snapshot();
+        }
         let Some(snap) = &self.snapshot else {
             let mut idle = DashboardSnapshot::default();
             idle.db_status = "초기화 중…".to_string();
@@ -405,6 +559,22 @@ impl DashboardController {
         self.paused = !self.paused;
         self.last_action_message =
             Some(if self.paused { "폴링 일시정지" } else { "폴링 재개" }.to_string());
+    }
+
+    /// LIVE ↔ DEMO 전환 — DEMO 진입 시 확인 상태를 해제한다(가상 주소 차단).
+    pub fn toggle_demo_mode(&mut self) {
+        self.demo_mode = !self.demo_mode;
+        if self.demo_mode {
+            self.confirm_kill_address = None;
+        }
+        self.last_action_message = Some(
+            if self.demo_mode {
+                "DEMO 시뮬레이션 미리보기 — LIVE로 돌아가려면 토글을 다시 누르세요"
+            } else {
+                "LIVE 스냅숏으로 복귀"
+            }
+            .to_string(),
+        );
     }
 
     /// 관측 전용 ↔ 제어 허용 — watch-only 잠금 시 무시된다.
@@ -431,6 +601,11 @@ impl DashboardController {
         if self.watch_only || !self.control_enabled {
             self.last_action_message =
                 Some("관측 전용 모드 — 상단 '제어 허용'을 먼저 켜세요".to_string());
+            return false;
+        }
+        if self.demo_mode {
+            self.last_action_message =
+                Some("DEMO 모드에서는 워커 중단을 실행할 수 없습니다 — LIVE로 전환하세요".to_string());
             return false;
         }
         if !snap.workers.iter().any(|w| w.address == address) {
@@ -725,6 +900,11 @@ pub fn poll_once(cfg: &PollerConfig, snapshotter: &mut LiveSyncSnapshotter) -> D
         }
         None => (None, None, None),
     };
+    // 세션 기록 — 동일 읽기전용 커넥션에서 최신 이벤트 조회(리댁션 내장).
+    let recent_log = conn
+        .as_ref()
+        .map(|c| fetch_recent_log(c, RECENT_LOG_LIMIT))
+        .unwrap_or_default();
     drop(conn);
     let global_routes = aggregate_global_routes(&repo_stats.values().cloned().collect::<Vec<_>>());
 
@@ -744,8 +924,216 @@ pub fn poll_once(cfg: &PollerConfig, snapshotter: &mut LiveSyncSnapshotter) -> D
         timing_summary: global_timing,
         shadow_summary: global_shadow,
         repo_stats,
+        recent_log,
         db_status,
         hc_available: probe_hc_available(&cfg.hc_bin),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DEMO 시뮬레이션 스냅숏 — TUI 5계층 토폴로지 미리보기 (`--demo` · LIVE/DEMO 토글)
+// ---------------------------------------------------------------------------
+
+/// 세션 기록 패널에 올리는 최대 이벤트 수 (TUI 하단 패널 6~8줄과 동일 규모).
+pub const RECENT_LOG_LIMIT: usize = 8;
+
+/// 데모용 live 워커 카드 — 주소 고정(활동바 안정 채움 계산에 사용).
+fn demo_worker(slot: RoleSlot, name: &str, activity: &str, short_model: &str) -> LiveWorkerInfo {
+    LiveWorkerInfo {
+        slot,
+        badge: format!("{} (실행 중)", short_model),
+        short_model: short_model.to_string(),
+        model_name: short_model.to_string(),
+        address: format!("demo-{}", name),
+        name: name.to_string(),
+        cwd: Some("/demo/demo-app".to_string()),
+        repo_tag: "demo-app".to_string(),
+        activity: activity.to_string(),
+        status: Some("working".to_string()),
+    }
+}
+
+fn demo_role(slot: &str, title: &str, model: &str, running: bool) -> RoleCardData {
+    RoleCardData {
+        slot: slot.to_string(),
+        title: title.to_string(),
+        standby_model: model.to_string(),
+        live_model: running.then(|| model.to_string()),
+        running,
+        readonly: false,
+        on_demand: slot == "advisor" || slot == "verifier",
+    }
+}
+
+fn demo_route(
+    id: &str,
+    name: &str,
+    p: f64,
+    samples: i64,
+    decision: DecisionLabel,
+) -> RouteMetric {
+    RouteMetric {
+        id: id.to_string(),
+        name: name.to_string(),
+        p,
+        basis: "measured".to_string(),
+        samples,
+        forced_split: false,
+        decision,
+    }
+}
+
+/// 내장 DEMO 토폴로지 스냅숏 — live DB/hc 없이 TUI 5계층 레이아웃을 그대로 미리본다.
+/// 순수 함수(외부 I/O 없음)이므로 DEMO 모드에서 폴러를 대체해도 부작용이 없다.
+pub fn demo_snapshot() -> DashboardSnapshot {
+    let routes = vec![
+        demo_route("file_select", "어느 파일", 0.86, 128, DecisionLabel::Sharp),
+        demo_route("tool_select", "어느 도구", 0.74, 96, DecisionLabel::Sharp),
+        demo_route("delegate_swarm", "스웜 위임", 0.62, 47, DecisionLabel::Split),
+        demo_route("retry_or_abort", "재시도 또는 중단", 0.31, 22, DecisionLabel::Split),
+    ];
+    let cost = CostStatsResult {
+        schema_v1: false,
+        total_events: 48,
+        by_status: CostByStatus { reported: 40, estimated: 5, unknown: 3 },
+        per_status: Default::default(),
+        reported_usd: 3.28,
+        estimated_usd: 0.61,
+        known_usd: 3.89,
+        unknown_events: 3,
+        total_usd_display: None,
+        tokens: CostTokensSummary {
+            input: 412_000,
+            output: 38_500,
+            cache_read: 96_000,
+            cache_write: 12_000,
+        },
+    };
+    let timing = TimingStatsResult {
+        intervals_unavailable: false,
+        coverage_ratio: 0.87,
+        execution_ms: 812_000.0,
+        sum_execution_ms: 1_904_000.0,
+        parallel_gain_ms: 1_092_000.0,
+        wait_ms: 96_000.0,
+        human_wait_ms: 12_000.0,
+        wall_ms: 2_610_000.0,
+        dropped: 0,
+        forks_total: 128,
+        forks_with_intervals: 111,
+        intervals: 111,
+    };
+    let shadow = DecisionApiShadowSummary {
+        total: 26,
+        ok: 26,
+        errors: 0,
+        shadow_count: 26,
+        on_applied_count: 0,
+        disagreed: 3,
+        disagreement_rate: Some(3.0 / 26.0),
+        total_input_tokens: 31_400,
+        total_cost_usd: 0.018,
+    };
+    let workers = vec![
+        demo_worker(
+            RoleSlot::Lead,
+            "w-lead-1",
+            "작업 분해 · Decision Gate 사전 확정 검토 중",
+            "pi:glm-5.3",
+        ),
+        demo_worker(
+            RoleSlot::Explore,
+            "w-explore-1",
+            "src/ui 레이아웃 구조 탐색 중",
+            "pi:gpt-5.6-luna",
+        ),
+        demo_worker(
+            RoleSlot::Coder,
+            "w-coder-1",
+            "renderApp.ts 5계층 토폴로지 리팩터 적용 중",
+            "pi:glm-5.3",
+        ),
+        demo_worker(
+            RoleSlot::Verifier,
+            "w-verify-1",
+            "cargo test -p demo-app 결과 교차 검토 중",
+            "pi:gpt-6-astra",
+        ),
+        demo_worker(
+            RoleSlot::Advisor,
+            "w-advisor-1",
+            "완료 전 최종 점검 자문 준비 중",
+            "zai:glm-5.3-flash",
+        ),
+    ];
+    let recent_log = vec![
+        RecentLogEntry {
+            time_hhmmss: "10:42:18".to_string(),
+            source: "wrap".to_string(),
+            source_role: "Decision Gate".to_string(),
+            message: "스웜 위임 · p=0.62 split — w-explore-1 배차".to_string(),
+            project_id: None,
+        },
+        RecentLogEntry {
+            time_hhmmss: "10:41:52".to_string(),
+            source: "wrap".to_string(),
+            source_role: "Worker".to_string(),
+            message: "w-coder-1 · renderApp.ts 토폴로지 리팩터 적용".to_string(),
+            project_id: None,
+        },
+        RecentLogEntry {
+            time_hhmmss: "10:41:30".to_string(),
+            source: "neon_backprop".to_string(),
+            source_role: "Verifier".to_string(),
+            message: "검증 통과 — 계획·결과 교차 검토 일치".to_string(),
+            project_id: None,
+        },
+        RecentLogEntry {
+            time_hhmmss: "10:40:07".to_string(),
+            source: "hook".to_string(),
+            source_role: "Advisor".to_string(),
+            message: "같은 오류 2회 감지 — 재시도 전략 자문 제안".to_string(),
+            project_id: None,
+        },
+        RecentLogEntry {
+            time_hhmmss: "10:39:44".to_string(),
+            source: "agy_stream".to_string(),
+            source_role: "Lead".to_string(),
+            message: "작업 분해 완료 — 하위 에이전트 3종 배차".to_string(),
+            project_id: None,
+        },
+    ];
+    DashboardSnapshot {
+        updated_at_label: "DEMO".to_string(),
+        profile_name: "demo".to_string(),
+        roster_source: "builtin-demo".to_string(),
+        roles: vec![
+            demo_role("lead", "Lead", "pi:glm-5.3", true),
+            demo_role("explore", "Explore", "pi:gpt-5.6-luna", true),
+            demo_role("coder", "Coder", "pi:glm-5.3", true),
+            demo_role("verifier", "Verifier", "pi:gpt-6-astra", true),
+            demo_role("advisor", "Advisor", "zai:glm-5.3-flash", true),
+        ],
+        workers,
+        agy_live_count: 0,
+        detected_repos: vec!["demo-app".to_string()],
+        repo_stats: BTreeMap::from([(
+            "demo-app".to_string(),
+            RepoStatsBundle {
+                project_id: Some("demo-project".to_string()),
+                routes: routes.clone(),
+                cost: Some(cost.clone()),
+                timing: Some(timing.clone()),
+                shadow: Some(shadow.clone()),
+            },
+        )]),
+        routes,
+        cost_summary: Some(cost),
+        timing_summary: Some(timing),
+        shadow_summary: Some(shadow),
+        recent_log,
+        db_status: "DEMO 시뮬레이션".to_string(),
+        hc_available: true,
     }
 }
 
@@ -915,6 +1303,24 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_demo_flag() {
+        let o = parse_gui_cli_options(&args(&["--demo"])).unwrap();
+        assert!(o.demo);
+        assert!(!o.watch_only);
+        // 다른 플래그와 조합 가능
+        let o2 = parse_gui_cli_options(&args(&["--demo", "--watch-only", "--poll-ms", "250"]))
+            .unwrap();
+        assert!(o2.demo);
+        assert!(o2.watch_only);
+        assert_eq!(o2.poll_ms, 250);
+        // 기본값은 DEMO 꺼짐 — 실제 관측이 기본
+        let o3 = parse_gui_cli_options(&args(&[])).unwrap();
+        assert!(!o3.demo);
+        // 도움말 텍스트에 --demo 옵션이 문서화되어 있다
+        assert!(HELP_TEXT.contains("--demo"));
+    }
+
+    #[test]
     fn cli_rejects_missing_values_bad_numbers_and_unknown_flags() {
         assert!(parse_gui_cli_options(&args(&["--db"])).is_err());
         assert!(parse_gui_cli_options(&args(&["--repo"])).is_err());
@@ -987,6 +1393,7 @@ mod tests {
             timing_summary: None,
             shadow_summary: None,
             repo_stats,
+            recent_log: vec![],
             db_status: "연결됨".to_string(),
             hc_available: true,
         }
@@ -1042,6 +1449,132 @@ mod tests {
         assert_eq!(beta.routes[0].basis, "prior");
         // 빈 문자열 = 전체
         assert_eq!(filter_snapshot_by_repo(&snap, Some("")).workers.len(), 2);
+    }
+
+    // ---------- 세션 기록 (RecentLogEntry 읽기전용 조회) ----------
+
+    #[test]
+    fn recent_log_fetch_orders_limits_redacts_and_maps_roles() {
+        let tmp = temp_dir("recent-log");
+        let db_path = tmp.join("decision.db");
+        {
+            use dgate_core::db::open_db;
+            let conn = open_db(db_path.to_str(), OpenDbOptions::default()).unwrap();
+            for i in 0..10 {
+                conn.execute(
+                    "INSERT INTO decision_events
+                       (project_id, source, route, tool_name, tool_class, ok, weight, is_retry, created_at_ms, error_snippet)
+                     VALUES (?1, ?2, ?3, ?4, 'shell_exec', ?5, 1.0, 0, ?6, ?7)",
+                    rusqlite::params![
+                        "proj-log",
+                        if i % 3 == 0 { "neon_backprop" } else { "wrap" },
+                        if i % 2 == 0 { "delegate_swarm" } else { "tool_select" },
+                        format!("tool-{}", i),
+                        if i == 9 { 0 } else { 1 },
+                        1_700_000_000_000i64 + i as i64 * 1000,
+                        if i == 9 {
+                            Some(" Authorization: Bearer sk-test1234567890abcdef".to_string())
+                        } else {
+                            None
+                        },
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        // 읽기전용으로만 다시 연다 — fetch는 조회만 한다
+        let ro = open_db(
+            Some(db_path.to_str().unwrap()),
+            OpenDbOptions { read_only: true, busy_timeout_ms: Some(500) },
+        )
+        .unwrap();
+        let entries = fetch_recent_log(&ro, 6);
+        assert_eq!(entries.len(), 6, "limit 존중");
+        // 최신순 — 첫 줄이 가장 최근 이벤트(i=9, 실패 + 시크릿 스니펫)
+        assert!(entries[0].message.contains("실패"));
+        assert!(entries[0].message.contains("<redacted>"), "Bearer 토큰 리댁션");
+        assert!(!entries[0].message.contains("sk-test1234567890abcdef"));
+        assert!(entries[0].time_hhmmss.len() == 8);
+        // 역할 매핑 — neon_backprop→Verifier, delegate_swarm→Worker, wrap+tool_select→Decision Gate
+        assert!(entries.iter().any(|e| e.source_role == "Verifier"));
+        assert!(entries.iter().any(|e| e.source_role == "Worker"));
+        assert!(entries.iter().any(|e| e.source_role == "Decision Gate"));
+        assert!(entries.iter().all(|e| e.project_id.as_deref() == Some("proj-log")));
+        // 존재하지 않는 테이블(빈 DB)·limit 0 — 패닉 없이 안전 폴백
+        let empty_db = tmp.join("empty.db");
+        let w = open_db(empty_db.to_str(), OpenDbOptions::default()).unwrap();
+        drop(w);
+        let ro2 = open_db(
+            Some(empty_db.to_str().unwrap()),
+            OpenDbOptions { read_only: true, busy_timeout_ms: None },
+        )
+        .unwrap();
+        assert_eq!(fetch_recent_log(&ro2, 6).len(), 0);
+        assert_eq!(fetch_recent_log(&ro, 0).len(), 0);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn filter_by_repo_also_filters_recent_log() {
+        let mut snap = snapshot_fixture();
+        snap.recent_log = vec![
+            RecentLogEntry {
+                time_hhmmss: "01:00:00".to_string(),
+                source: "wrap".to_string(),
+                source_role: "Decision Gate".to_string(),
+                message: "alpha 이벤트".to_string(),
+                project_id: Some("proj_alpha".to_string()),
+            },
+            RecentLogEntry {
+                time_hhmmss: "01:00:01".to_string(),
+                source: "wrap".to_string(),
+                source_role: "Worker".to_string(),
+                message: "기타 이벤트".to_string(),
+                project_id: Some("proj_other".to_string()),
+            },
+        ];
+        let alpha = filter_snapshot_by_repo(&snap, Some("alpha"));
+        assert_eq!(alpha.recent_log.len(), 1);
+        assert_eq!(alpha.recent_log[0].message, "alpha 이벤트");
+        // 전체 뷰는 로그를 그대로 유지
+        assert_eq!(filter_snapshot_by_repo(&snap, None).recent_log.len(), 2);
+    }
+
+    // ---------- 동적 N스템 · 라이브 모션 활동 판정 ----------
+
+    #[test]
+    fn visible_worker_columns_matches_topology() {
+        // 라이브 0 — 3슬롯 청사진(침묵 3스템 와이어)
+        assert_eq!(visible_worker_columns(0), 3);
+        // 1/2/3 — 카드 수 = 스템 수 (고정 3스템 매달림 금지)
+        assert_eq!(visible_worker_columns(1), 1);
+        assert_eq!(visible_worker_columns(2), 2);
+        assert_eq!(visible_worker_columns(3), 3);
+        // 4+ — 최대 4열, 초과분 2행 랩
+        assert_eq!(visible_worker_columns(4), 4);
+        assert_eq!(visible_worker_columns(6), 4);
+    }
+
+    #[test]
+    fn has_active_work_idle_vs_running_vs_demo() {
+        let mut snap = DashboardSnapshot::default();
+        // 라이브 유휴(실행 0) — 반드시 false → 제로-첸 유휴 불변식
+        assert!(!has_active_work(&snap, false));
+        // DEMO 모드는 항상 활동
+        assert!(has_active_work(&snap, true));
+
+        // 실행 중 워커 1명 → 활동
+        snap.workers.push(worker("addr-a", "w-1", "alpha", None));
+        assert!(has_active_work(&snap, false));
+
+        // 완료(done)만 남은 로스터는 활동 아님 — 침착한 유휴 유지
+        snap.workers[0].status = Some("done".to_string());
+        assert!(!has_active_work(&snap, false));
+
+        // status 미상(None) 세션은 실행 중으로 본다(카드 '실행 중' 표기와 동일 기준)
+        snap.workers[0].status = None;
+        assert!(has_active_work(&snap, false));
     }
 
     // ---------- 2단계 중단 상태 기계 ----------
@@ -1125,6 +1658,68 @@ mod tests {
         assert_eq!(c.selected_repo, None);
         c.select_repo(Some("  "));
         assert_eq!(c.selected_repo, None);
+    }
+
+    // ---------- DEMO 모드 (LIVE/DEMO 토글 · --demo 기동) ----------
+
+    #[test]
+    fn controller_toggle_demo_mode_swaps_filtered_snapshot() {
+        let mut c = DashboardController::new(false);
+        c.apply_snapshot(snapshot_fixture());
+        assert!(!c.demo_mode);
+        assert_eq!(c.filtered().workers.len(), 2, "기본은 LIVE 스냅숏");
+
+        c.toggle_demo_mode();
+        assert!(c.demo_mode);
+        let demo = c.filtered();
+        assert_eq!(demo.profile_name, "demo");
+        assert_eq!(demo.workers.len(), 5, "DEMO는 5역할 카드를 모두 제시");
+        assert_eq!(demo.detected_repos, vec!["demo-app".to_string()]);
+        assert!(demo.db_status.contains("DEMO"));
+        assert!(!demo.recent_log.is_empty(), "DEMO에도 세션 기록 미리보기가 있다");
+
+        c.toggle_demo_mode();
+        assert!(!c.demo_mode);
+        assert_eq!(c.filtered().workers.len(), 2, "LIVE 복귀 시 실제 스냅숏 재개");
+    }
+
+    #[test]
+    fn demo_snapshot_shape_is_realistic_topology() {
+        let s = demo_snapshot();
+        // 4라우트 — sharp/split 혼합, 전부 실측 표기
+        assert_eq!(s.routes.len(), 4);
+        assert!(s.routes.iter().any(|r| r.decision == DecisionLabel::Sharp));
+        assert!(s.routes.iter().any(|r| r.decision == DecisionLabel::Split));
+        assert!(s.routes.iter().all(|r| r.basis == "measured" && r.samples > 0));
+        // 5역할 로스터 전부 실행 중 + 비용/시간/shadow 요약 존재
+        assert_eq!(s.roles.len(), 5);
+        assert!(s.roles.iter().all(|r| r.running));
+        assert!(s.cost_summary.is_some());
+        assert!(s.timing_summary.is_some());
+        assert!(s.shadow_summary.is_some());
+        // 세션 기록 역할 태그는 TUI 5색 역할 안에서만
+        let known = ["Decision Gate", "Worker", "Verifier", "Advisor", "Lead"];
+        assert!(s.recent_log.iter().all(|e| known.contains(&e.source_role.as_str())));
+    }
+
+    #[test]
+    fn controller_kill_blocked_in_demo_mode() {
+        let mut c = DashboardController::new(false);
+        c.apply_snapshot(snapshot_fixture());
+        c.toggle_control();
+        assert!(c.control_enabled);
+        // DEMO 진입 → 라이브에 있는 주소라도 중단 1단계 진입 불가
+        c.toggle_demo_mode();
+        assert!(!c.request_kill("addr-a"), "DEMO 모드에서는 중단 요청 거부");
+        assert!(c.confirm_kill_address.is_none());
+        assert!(c.last_action_message.as_deref().unwrap().contains("DEMO"));
+        // LIVE 복귀 → 동일 주소가 다시 허용된다
+        c.toggle_demo_mode();
+        assert!(c.request_kill("addr-a"));
+        // DEMO 재진입 시 확인 상태도 해제된다(가상 주소 잔류 방지)
+        assert!(c.request_kill("addr-a"));
+        c.toggle_demo_mode();
+        assert!(c.confirm_kill_address.is_none());
     }
 
     #[test]
@@ -1351,6 +1946,11 @@ mod tests {
         assert!((gcost.known_usd - 1.25).abs() < 1e-9);
         assert_eq!(gcost.unknown_events, 1);
         assert_eq!(snap.shadow_summary.as_ref().unwrap().disagreed, 1);
+        // 세션 기록 — 삽입한 decision_events 2건이 최신순으로 조회된다
+        assert_eq!(snap.recent_log.len(), 2);
+        assert!(snap.recent_log.iter().all(|e| e.source == "wrap"));
+        assert!(snap.recent_log.iter().all(|e| e.source_role == "Decision Gate"));
+        assert!(snap.recent_log.iter().all(|e| !e.message.is_empty()));
 
         // 레포 필터링 연결 확인 — filtered 뷰도 동일 번들로 교체된다
         let filtered = filter_snapshot_by_repo(&snap, Some("my-gui-repo"));

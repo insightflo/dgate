@@ -9,12 +9,15 @@ import {
 import { LOG_FILTER_LABELS, TRIGGER_LABELS, effortToGauge, getFilteredLogs, sortRoutesForDisplay } from '../state/store.ts';
 import { THEME, lerpColor, resolveColorKey, type RGB } from '../theme.ts';
 import type { AppState, SwarmCard } from '../types.ts';
-import { computeLayout, type CompactLayout, type FullLayout } from './layout.ts';
+import { computeLayout, maxCardSlotsFor, type CompactLayout, type FullLayout } from './layout.ts';
 import { renderModalOverlay } from './renderModal.ts';
 
 export function renderFrame(state: AppState, cols: number, rows: number): CellBuffer {
   const buf = new CellBuffer(cols, rows, THEME.bg, THEME.fg);
-  const layout = computeLayout(cols, rows);
+  // 실제 보여줄 워커 카드 수(라이브 가변 목록 우선)만큼 레이아웃 카드 슬롯을 구성한다.
+  const workerCards = workerCardsOf(state);
+  const visibleCount = Math.max(1, Math.min(workerCards.length, maxCardSlotsFor(cols)));
+  const layout = computeLayout(cols, rows, visibleCount);
 
   if (layout.kind === 'full') {
     renderFullLayout(buf, state, layout);
@@ -90,6 +93,53 @@ function renderFullLayout(buf: CellBuffer, state: AppState, L: FullLayout): void
 /** Workers 패널 카드 소스 — 라이브 hc 워커 카드가 있으면 우선, 없으면 기존 3슬롯 cards로 폴백. */
 function workerCardsOf(state: AppState): SwarmCard[] {
   return state.liveWorkers && state.liveWorkers.length > 0 ? state.liveWorkers : state.cards;
+}
+
+/**
+ * 카드/와이어 라이브 모션 게이트 — 데모이거나 실제 라이브 워커 목록이 있을 때만 움직인다.
+ * watch 폴백 cards(자리표)는 실제 실행이 아니므로 정적으로 유지(침착 대기 불변식).
+ */
+function liveMotionOf(state: AppState): boolean {
+  return state.mode === 'demo' || (state.liveWorkers !== undefined && state.liveWorkers.length > 0);
+}
+
+/** 브라일 스피너 프레임 — simTime 구동, seed(카드 인덱스)로 카드마다 위상 엇갈림. */
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'] as const;
+function spinnerFrame(simTime: number, seed: number): string {
+  const idx =
+    ((Math.floor(simTime * 8 + seed) % SPINNER_FRAMES.length) + SPINNER_FRAMES.length) %
+    SPINNER_FRAMES.length;
+  return SPINNER_FRAMES[idx]!;
+}
+
+/** 부재 진행률(라이브 hc 워커는 % 숫자를 못 줌) — 매끄럽게 쓸어지는 활성 블록 바. */
+function drawIndeterminateBar(
+  buf: CellBuffer,
+  x: number,
+  y: number,
+  w: number,
+  fillFg: RGB,
+  trackBg: RGB,
+  simTime: number,
+  seed: number
+): void {
+  if (w <= 0) return;
+  const blockW = Math.max(3, Math.floor(w / 4));
+  const trackFg = lerpColor(trackBg, THEME.muted, 0.18);
+  for (let i = 0; i < w; i++) buf.setChar(x + i, y, '░', trackFg, trackBg, false);
+  const travel = w + blockW;
+  const t = (((simTime * 0.7 + seed * 0.31) % 1) + 1) % 1;
+  const start = Math.round(t * travel) - blockW;
+  for (let i = 0; i < blockW; i++) {
+    const px = x + start + i;
+    if (px >= x && px < x + w) buf.setChar(px, y, '█', fillFg, trackBg, true);
+  }
+}
+
+/** Lead 활성 판정 — 데모이거나 phase가 대기/완료류가 아닐 때. 와이어·패널 스피너 공용. */
+const IDLE_PHASES = new Set(['', '대기 중', '완료', '중단됨', 'idle', 'done']);
+function isLeadActive(state: AppState): boolean {
+  return state.mode === 'demo' || !IDLE_PHASES.has(state.phase.trim());
 }
 
 function renderHeader(
@@ -236,7 +286,7 @@ function renderPipelineWires(buf: CellBuffer, state: AppState, L: FullLayout): v
     pathMainToDec.push([cx, y]);
   }
 
-  // 2) Decision 하단 -> 위임 라벨 -> 팬아웃 트리 -> 3개 카드 상단
+  // 2) Decision 하단 -> 위임 라벨 -> 팬아웃 트리 -> 실제 카드 상단
   const dBottom = L.decision.y + L.decision.h;
   for (let y = dBottom; y < L.fanOutY; y++) {
     if (y !== L.delegateLabelY) {
@@ -244,41 +294,45 @@ function renderPipelineWires(buf: CellBuffer, state: AppState, L: FullLayout): v
     }
   }
 
-  const c0x = L.cards[0].x + Math.floor(L.cards[0].w / 2);
-  const c1x = L.cards[1].x + Math.floor(L.cards[1].w / 2);
-  const c2x = L.cards[2].x + Math.floor(L.cards[2].w / 2);
+  // 실제 렌더링된 카드의 중심 x목록 — 빈 슬롯으로 향하는 와이어는 그리지 않는다
+  const xs = L.cards.map((r) => r.x + Math.floor(r.w / 2));
+  const stemSet = new Set(xs);
 
-  // 팬아웃 수평선: ┌────────┼────────┐
-  const pathFanOutLeft: Array<readonly [number, number]> = [];
-  const pathFanOutRight: Array<readonly [number, number]> = [];
-  for (let x = c0x; x <= c2x; x++) {
-    let ch = '─';
-    if (x === c0x) ch = '┌';
-    else if (x === c2x) ch = '┐';
-    else if (x === c1x && x === cx) ch = '┼';
-    else if (x === c1x) ch = '┬';
-    else if (x === cx) ch = '┴';
-    buf.setChar(x, L.fanOutY, ch, wireFg, THEME.bg);
-  }
-  for (let x = cx; x >= c0x; x--) pathFanOutLeft.push([x, L.fanOutY]);
-  for (let x = cx; x <= c2x; x++) pathFanOutRight.push([x, L.fanOutY]);
+  // 팬아웃/팬인 수평 레일 — min(cx, xs[0]) .. max(cx, xs[last]) 구간만, 정확한 접합 문자 사용
+  const drawRail = (y: number, kind: 'fanOut' | 'fanIn'): void => {
+    const railL = Math.min(cx, xs[0]!);
+    const railR = Math.max(cx, xs[xs.length - 1]!);
+    if (railL === railR) {
+      // 카드 1장 — 빈 슬롯으로 가로선 없이 곧장 세로 스템
+      buf.setChar(cx, y, '│', wireFg, THEME.bg);
+      return;
+    }
+    for (let x = railL; x <= railR; x++) {
+      const isStem = stemSet.has(x);
+      const isFeed = x === cx;
+      let ch = '─';
+      if (isStem && isFeed) ch = '┼';
+      else if (kind === 'fanOut') {
+        if (isFeed) ch = '┴';
+        else if (isStem) ch = '┬';
+        else if (x === railL) ch = '┌';
+        else if (x === railR) ch = '┐';
+      } else {
+        if (isFeed) ch = '┬';
+        else if (isStem) ch = '┴';
+        else if (x === railL) ch = '└';
+        else if (x === railR) ch = '┘';
+      }
+      buf.setChar(x, y, ch, wireFg, THEME.bg);
+    }
+  };
+  drawRail(L.fanOutY, 'fanOut');
+  drawRail(L.fanInY, 'fanIn');
 
   // 3) 카드 하단 -> 팬인 트리 -> 다시 Lead 상단
-  const pathFanIn: Array<readonly [number, number]> = [];
-  for (let x = c0x; x <= c2x; x++) {
-    let ch = '─';
-    if (x === c0x) ch = '└';
-    else if (x === c2x) ch = '┘';
-    else if (x === c1x && x === cx) ch = '┼';
-    else if (x === c1x) ch = '┴';
-    else if (x === cx) ch = '┬';
-    buf.setChar(x, L.fanInY, ch, wireFg, THEME.bg);
-    pathFanIn.push([x, L.fanInY]);
-  }
   for (let y = L.fanInY + 1; y < L.back.y; y++) {
     const isLast = y === L.back.y - 1;
     buf.setChar(cx, y, isLast ? '▼' : '│', wireFg, THEME.bg);
-    pathFanIn.push([cx, y]);
   }
 
   // 4) Lead Main 우측 <-> Verifier 좌측 교차 검증 링크
@@ -305,20 +359,40 @@ function renderPipelineWires(buf: CellBuffer, state: AppState, L: FullLayout): v
   // 데이터 흐름 펄스 애니메이션 (gemini_sub_neon.html의 comet 대응)
   const t = state.simTime;
   const isDemo = state.mode === 'demo';
-  const idlePhases = new Set(['', '대기 중', '완료', '중단됨', 'idle', 'done']);
-  const leadActive = isDemo || !idlePhases.has(state.phase.trim());
-  const hasRunningWorkers =
-    isDemo || (state.liveWorkers !== undefined
-      ? state.liveWorkers.some((w) => w.status === 'running')
-      : state.swarmActive > 0);
+  const leadActive = isLeadActive(state);
+  const hasRunningWorkers = isDemo || (state.liveWorkers !== undefined
+    ? state.liveWorkers.some((w) => w.status === 'running')
+    : state.swarmActive > 0);
 
   if (leadActive || hasRunningWorkers) {
     buf.drawPulseAlongPath(pathMainToDec, t * 0.9, THEME.orange, '●');
   }
-  if (hasRunningWorkers) {
-    buf.drawPulseAlongPath(pathFanOutLeft, t * 0.42, THEME.blue, '●');
-    buf.drawPulseAlongPath(pathFanOutRight, t * 0.36 + 0.35, THEME.blue, '●');
-    buf.drawPulseAlongPath(pathFanIn, t * 0.28, THEME.fg, '•');
+
+  // 카드별 개별 펄스 — 실행 중인 카드로만 흐른다(대기/빈 카드는 펄스 0개).
+  // 위상을 카드 인덱스로 엇갈리게 해 2번째(가운데)·4번째 워커도 확실히 보이게 한다.
+  if (liveMotionOf(state)) {
+    const workerCards = workerCardsOf(state);
+    L.cards.forEach((_rect, i) => {
+      const card = workerCards[i];
+      if (!card || (!isDemo && card.status !== 'running')) return;
+
+      const tx = xs[i]!;
+      // 팬아웃: Decision 하단 세로 → fanOutY 레일 → 카드 i 상단 (위임 라벨 행은 제외)
+      const pathOut: Array<readonly [number, number]> = [];
+      for (let y = dBottom; y < L.fanOutY; y++) {
+        if (y !== L.delegateLabelY) pathOut.push([cx, y]);
+      }
+      if (tx < cx) for (let x = cx; x >= tx; x--) pathOut.push([x, L.fanOutY]);
+      else for (let x = cx; x <= tx; x++) pathOut.push([x, L.fanOutY]);
+      buf.drawPulseAlongPath(pathOut, t * 0.48 + i * 0.27, THEME.blue, '●');
+
+      // 팬인: 카드 i 하단 → fanInY 레일 → 다시 Lead(back) 상단
+      const pathIn: Array<readonly [number, number]> = [];
+      if (tx >= cx) for (let x = tx; x >= cx; x--) pathIn.push([x, L.fanInY]);
+      else for (let x = tx; x <= cx; x++) pathIn.push([x, L.fanInY]);
+      for (let y = L.fanInY + 1; y < L.back.y; y++) pathIn.push([cx, y]);
+      buf.drawPulseAlongPath(pathIn, t * 0.3 + i * 0.19, THEME.fg, '•');
+    });
   }
 
   if (pathNeonGo.length > 0) {
@@ -401,15 +475,11 @@ function renderAdvisorPanel(buf: CellBuffer, state: AppState, L: FullLayout): vo
     buf.writeCentered(ix, hy++, iw, 'Advisor', THEME.purple, THEME.bg, true);
   }
   if (hy < L.tr0Row) {
-    buf.writeCentered(
-      ix,
-      hy++,
-      iw,
-      `${state.rosterLabels.advisor} · ${state.advisorState}`,
-      THEME.purple,
-      THEME.bg,
-      state.advisorState === '자문 중'
-    );
+    const advisorActive = state.advisorState === '자문 중';
+    const advisorTitle = `${state.rosterLabels.advisor} · ${state.advisorState}${
+      advisorActive ? ` ${spinnerFrame(state.simTime, 3)}` : ''
+    }`;
+    buf.writeCentered(ix, hy++, iw, advisorTitle, THEME.purple, THEME.bg, advisorActive);
   }
   if (hy < L.tr0Row) {
     buf.writeCentered(
@@ -550,12 +620,22 @@ function renderMainPanel(buf: CellBuffer, state: AppState, L: FullLayout): void 
     buf.writeCentered(ix, cy++, iw, state.mainSummary, THEME.fg, panelBg, false);
   }
   if (cy < R.y + R.h - 1) {
-    buf.writeSegmentsCentered(ix, cy++, iw, [
+    const phaseSegs: Array<{ text: string; fg: RGB; bg: RGB; bold?: boolean }> = [
       { text: 'effort ', fg: THEME.muted, bg: panelBg },
       { text: effortToGauge(state.effort), fg: THEME.orange, bg: panelBg, bold: true },
       { text: ' · ', fg: THEME.muted, bg: panelBg },
       { text: state.phase, fg: THEME.fg, bg: panelBg },
-    ]);
+    ];
+    // Lead 활성 시 위상 배지 옆 회전 스피너 — 패널이 살아 있음을 즉시 보여준다(대기 시 정지)
+    if (isLeadActive(state)) {
+      phaseSegs.push({
+        text: ` ${spinnerFrame(state.simTime, 2)}`,
+        fg: THEME.orange,
+        bg: panelBg,
+        bold: true,
+      });
+    }
+    buf.writeSegmentsCentered(ix, cy++, iw, phaseSegs);
   }
   if (cy < R.y + R.h - 1) {
     buf.writeCentered(ix, cy++, iw, state.modelFlag, THEME.muted, panelBg, false);
@@ -634,22 +714,34 @@ function renderNeonPanel(buf: CellBuffer, state: AppState, L: FullLayout): void 
     true
   );
 
-  // 2) 프로그레스 바 + 퍼센트(또는 idle 시 —)
+  // 2) 프로그레스 바 + 퍼센트(또는 idle 시 —) — 라이브 검증은 %를 못 주므로 부재 활성 바
   if (cy < R.y + R.h - 1) {
-    const pctStr =
-      state.neonState === 'idle' ? '  — ' : padLeftWidth(`${state.neonProgress}%`, 4);
     const barW = Math.max(6, iw - 5);
     const startX = ix + Math.max(0, Math.floor((iw - (barW + 1 + 4)) / 2));
     const fillCol = isFail ? THEME.trafficRed : THEME.neon;
-    buf.drawProgressBar(
-      startX,
-      cy,
-      barW,
-      state.neonState === 'idle' ? 0 : state.neonProgress / 100,
-      fillCol,
-      THEME.bgNeonTrack
-    );
-    buf.writeText(startX + barW + 1, cy, pctStr, THEME.muted, panelBg);
+    if (isRun && state.neonProgress === 0) {
+      drawIndeterminateBar(buf, startX, cy, barW, fillCol, THEME.bgNeonTrack, state.simTime, 1);
+      buf.writeText(
+        startX + barW + 1,
+        cy,
+        `${spinnerFrame(state.simTime, 1)} RUN`,
+        THEME.neon,
+        panelBg,
+        true
+      );
+    } else {
+      const pctStr =
+        state.neonState === 'idle' ? '  — ' : padLeftWidth(`${state.neonProgress}%`, 4);
+      buf.drawProgressBar(
+        startX,
+        cy,
+        barW,
+        state.neonState === 'idle' ? 0 : state.neonProgress / 100,
+        fillCol,
+        THEME.bgNeonTrack
+      );
+      buf.writeText(startX + barW + 1, cy, pctStr, THEME.muted, panelBg);
+    }
     cy++;
   }
 
@@ -762,19 +854,35 @@ function renderDecisionPanel(buf: CellBuffer, state: AppState, L: FullLayout): v
 }
 
 function renderSwarmSection(buf: CellBuffer, state: AppState, L: FullLayout): void {
-  // 위임 라벨 (하위 에이전트에 위임 · Workers)
+  // 위임 라벨 (하위 에이전트에 위임 · Workers) — 슬롯 초과 워커는 +N 배지로 안내
+  const workerCards = workerCardsOf(state);
+  const overflow = workerCards.length - L.cards.length;
   if (L.delegateLabelY < L.fanOutY) {
-    const spanW = L.cards[2].x + L.cards[2].w - L.cards[0].x;
-    buf.writeSegmentsCentered(L.cards[0].x, L.delegateLabelY, spanW, [
+    const first = L.cards[0]!;
+    const last = L.cards[L.cards.length - 1]!;
+    const cardSpanW = last.x + last.w - first.x;
+    // 카드 1~2장일 땐 라벨이 카드 폭보다 길어질 수 있어 decision 폭까지 중앙 확장
+    const labelW = Math.max(cardSpanW, Math.min(36, L.decision.w));
+    const labelX = L.centerX - Math.floor(labelW / 2);
+    const labelSegs: Array<{ text: string; fg: RGB; bg: RGB; bold?: boolean }> = [
       { text: '하위 에이전트에 위임 · ', fg: THEME.fg, bg: THEME.bg },
       { text: 'Workers', fg: THEME.blue, bg: THEME.bg, bold: true },
-    ]);
+    ];
+    if (overflow > 0) {
+      labelSegs.push({
+        text: ` · +${overflow}개 더 (s:전체)`,
+        fg: THEME.orange,
+        bg: THEME.bg,
+        bold: true,
+      });
+    }
+    buf.writeSegmentsCentered(labelX, L.delegateLabelY, labelW, labelSegs);
   }
 
   const focused = state.focus === 'swarm';
   const errAdvisory = state.activeTrigger === 1;
   // 라이브 동기화 중이면 가변 길이 라이브 워커 카드를, 아니면 트랜스크립트 3슬롯 cards를
-  const workerCards = workerCardsOf(state);
+  const motion = liveMotionOf(state);
 
   L.cards.forEach((cardRect, idx) => {
     const card = workerCards[idx];
@@ -791,7 +899,7 @@ function renderSwarmSection(buf: CellBuffer, state: AppState, L: FullLayout): vo
       style: focused || cardAdvisoryGlow ? 'heavy' : 'single',
       borderColor,
       fillBg: cardBg,
-      rightLabel: focused && idx === 2 ? 'Enter:50슬롯' : undefined,
+      rightLabel: focused && idx === L.cards.length - 1 ? 'Enter:50슬롯' : undefined,
       rightLabelColor: THEME.blue,
       boldBorder: focused || cardAdvisoryGlow,
     });
@@ -808,13 +916,35 @@ function renderSwarmSection(buf: CellBuffer, state: AppState, L: FullLayout): vo
       buf.writeCentered(ix, cy++, iw, card.model, THEME.blue, cardBg, false);
     }
 
-    // 프로그레스 바 + 퍼센트
+    // 프로그레스 바 + 퍼센트 — 라이브 실행 중 0%는 고정 바가 아니라
+    // 부재 활성 바(흘러가는 블록) + 스피너 + RUN 으로 살아 있음을 표시한다.
     if (cy < cardRect.y + cardRect.h - 1) {
-      const pctStr = padLeftWidth(`${card.progress}%`, 4);
       const barW = Math.max(6, iw - 6);
       const startX = ix + Math.max(0, Math.floor((iw - (barW + 1 + 4)) / 2));
-      buf.drawProgressBar(startX, cy, barW, card.progress / 100, THEME.blue, THEME.bgBlueTrack);
-      buf.writeText(startX + barW + 1, cy, pctStr, THEME.muted, cardBg);
+      if (motion && card.status === 'running' && card.progress === 0) {
+        drawIndeterminateBar(
+          buf,
+          startX,
+          cy,
+          barW,
+          THEME.blue,
+          THEME.bgBlueTrack,
+          state.simTime,
+          idx
+        );
+        buf.writeText(
+          startX + barW + 1,
+          cy,
+          `${spinnerFrame(state.simTime, idx)} RUN`,
+          THEME.blue,
+          cardBg,
+          true
+        );
+      } else {
+        const pctStr = padLeftWidth(`${card.progress}%`, 4);
+        buf.drawProgressBar(startX, cy, barW, card.progress / 100, THEME.blue, THEME.bgBlueTrack);
+        buf.writeText(startX + barW + 1, cy, pctStr, THEME.muted, cardBg);
+      }
       cy++;
     }
 
@@ -823,7 +953,7 @@ function renderSwarmSection(buf: CellBuffer, state: AppState, L: FullLayout): vo
       buf.writeCentered(cardRect.x + 1, cy++, cardRect.w - 2, card.description, THEME.fgSoft, cardBg, false);
     }
 
-    // 상태 표시 (✓ 완료 / ◉ 실행 중 / ▪ 대기 중 / ✕ 오류)
+    // 상태 표시 (✓ 완료 / ⠙ 실행 중 / ▪ 대기 중 / ✕ 오류) — 실행 중 라이브 모션일 때만 회전
     if (cy < cardRect.y + cardRect.h - 1) {
       const isDone = card.status === 'done' || card.progress >= 100;
       const isIdle = card.status === 'idle' && card.progress === 0;
@@ -834,7 +964,9 @@ function renderSwarmSection(buf: CellBuffer, state: AppState, L: FullLayout): vo
           ? '✓ 완료'
           : isIdle
             ? '▪ 대기 중'
-            : '◉ 실행 중';
+            : motion
+              ? `${spinnerFrame(state.simTime, idx)} 실행 중`
+              : '◉ 실행 중';
       const fg = isErr
         ? THEME.trafficRed
         : isDone
@@ -1183,18 +1315,28 @@ function renderCompactLayout(buf: CellBuffer, state: AppState, L: CompactLayout)
     const ix = B.x + 2;
     const iw = B.w - 4;
     let cy = B.y + 1;
-    for (const c of workerCardsOf(state)) {
+    const motion = liveMotionOf(state);
+    for (const [idx, c] of workerCardsOf(state).entries()) {
       if (cy >= B.y + B.h - 1) break;
       buf.writeText(ix, cy, padRightWidth(c.name, 10), THEME.blue, THEME.bg, true);
-      buf.drawProgressBar(ix + 11, cy, Math.max(10, iw - 28), c.progress / 100, THEME.blue, THEME.bgBlueTrack);
-      buf.writeRight(
-        ix,
-        cy,
-        iw,
-        `${c.progress}% ${c.progress >= 100 ? '✓완료' : '◉실행'}`,
-        c.progress >= 100 ? THEME.green : THEME.blue,
-        THEME.bg
-      );
+      const barW = Math.max(10, iw - 28);
+      if (motion && c.status === 'running' && c.progress === 0) {
+        drawIndeterminateBar(buf, ix + 11, cy, barW, THEME.blue, THEME.bgBlueTrack, state.simTime, idx);
+        buf.writeRight(ix, cy, iw, `${spinnerFrame(state.simTime, idx)} RUN`, THEME.blue, THEME.bg, true);
+      } else {
+        buf.drawProgressBar(ix + 11, cy, barW, c.progress / 100, THEME.blue, THEME.bgBlueTrack);
+        const runningSpin = motion && c.status === 'running' && c.progress < 100;
+        buf.writeRight(
+          ix,
+          cy,
+          iw,
+          `${c.progress}% ${
+            c.progress >= 100 ? '✓완료' : runningSpin ? `${spinnerFrame(state.simTime, idx)} 실행` : '◉실행'
+          }`,
+          c.progress >= 100 ? THEME.green : THEME.blue,
+          THEME.bg
+        );
+      }
       cy++;
       if (cy < B.y + B.h - 1) {
         buf.writeText(ix + 2, cy++, c.description, THEME.muted, THEME.bg, false, iw - 2);
