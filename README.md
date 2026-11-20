@@ -2,6 +2,14 @@
 
 5개 역할 슬롯(lead·explore·coder·verifier·advisor)에 임의의 로컬 CLI 에이전트(claude·codex·devin·pi·gemini·agy 및 cli: "custom"으로 임의 로컬 CLI 전부 지원)를 바인딩해, **실측 통계 기반 Decision Gate**가 저비용 경로와 리드 승격 경로를 자동 분기하는 오케스트레이션 시스템이다. 핵심 목적:
 
+<!-- gitreels:start -->
+<p align="center">
+  <a href="https://gitreels.com/insightflo/dgate"><img src="https://gitreels.com/insightflo/dgate.webp" alt="insightflo/dgate in 15 seconds" width="100%"></a>
+  <br>
+  <a href="https://gitreels.com"><img src="https://gitreels.com/badge.svg" alt="Made with GitReels" height="24"></a>
+</p>
+<!-- gitreels:end -->
+
 - **비용·리드 턴 절감** — 통계적으로 안정된 조사 태스크는 Pre-Lead 라우터가 읽기전용 워커로 직행시켜 리드 LLM 턴을 0으로 만든다.
 - **모델 가변성** — 어떤 모델을 어느 역할에 쓸지는 `roster.json` 설정 파일 하나로 교체한다. 코드 수정 불필요.
 - **로컬 전체 프로젝트 공용** — `--repo <path>`로 이 머신의 어느 로컬 저장소에서든 같은 오케스트레이터를 실행한다.
