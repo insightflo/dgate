@@ -30,6 +30,7 @@ import {
   isObservableTerminal,
   isWorkerTerminal,
   matchesRepoScope,
+  matchesSessionScope,
   mergeLiveRosterLabels,
   normalizeTopLevelWorker,
   type HcTerminalDetail,
@@ -44,7 +45,7 @@ import {
 import { createInitialState } from '../src/state/store.ts';
 import { renderFrame } from '../src/ui/renderApp.ts';
 import { computeLayout, type FullLayout } from '../src/ui/layout.ts';
-import { applyLiveRolePanels, createLiveRoleTrail, formatElapsedMmss } from '../src/cli.ts';
+import { applyLiveRolePanels, createLiveRoleTrail, formatElapsedMmss, resolveTuiScope } from '../src/cli.ts';
 import type { RosterDisplayLabels } from '../src/types.ts';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..');
@@ -1287,6 +1288,135 @@ test('18.9 syncer — 최상위 working antigravity/pi만 Lead로 관측, idle·
     }
   } finally {
     syncer.stop();
+    env.restore();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// ---------- TUI 세션 스코프 기본값 (w-tui-session-scope) ----------
+
+test('19. resolveTuiScope — 5가지 스코프 판정 (기본 세션/레포·--all·--repo·--session)', () => {
+  const cwd = path.join('/tmp', 'Gemini_trick');
+  const envOther: NodeJS.ProcessEnv = {};
+  const envSession: NodeJS.ProcessEnv = { HC_TERMINAL_ID: '  t1bg  ' };
+
+  // ① 기본 + HC_TERMINAL_ID — 현재 세션 스코프, 라벨 '레포명·세션ID'
+  const s1 = resolveTuiScope({}, envSession, cwd);
+  assert.equal(s1.kind, 'session');
+  assert.equal(s1.sessionId, 't1bg'); // trim 적용
+  assert.equal(s1.repoFilterDir, null);
+  assert.equal(s1.scopeLabel, 'Gemini_trick·t1bg');
+
+  // ② 기본 + HC_TERMINAL_ID 부재 — 현재 cwd 레포 스코프
+  const s2 = resolveTuiScope({}, envOther, cwd);
+  assert.equal(s2.kind, 'repo');
+  assert.equal(s2.sessionId, null);
+  assert.equal(s2.repoFilterDir, path.resolve(cwd));
+  assert.equal(s2.scopeLabel, 'Gemini_trick');
+
+  // ③ --all — 전역 (라벨·필터 없음)
+  const s3 = resolveTuiScope({ all: true }, envSession, cwd); // env 무시 우선순위
+  assert.deepEqual(s3, { kind: 'all', repoFilterDir: null, sessionId: null, scopeLabel: null });
+
+  // ④ --repo <dir> — 해당 레포 (HC_TERMINAL_ID 있어도 --repo 우선은 아님 — --all 다음, env 전)
+  const s4 = resolveTuiScope({ repoDir: path.join('rel', 'my-repo') }, envOther, cwd);
+  assert.equal(s4.kind, 'repo');
+  assert.equal(s4.repoFilterDir, path.resolve(path.join('rel', 'my-repo')));
+  assert.equal(s4.scopeLabel, 'my-repo');
+
+  // ⑤ --session <id> — 세션 스코프 (+ --repo 병행 시 레포 필터도 유지)
+  const s5 = resolveTuiScope({ sessionId: 't155' }, envOther, cwd);
+  assert.equal(s5.kind, 'session');
+  assert.equal(s5.sessionId, 't155');
+  assert.equal(s5.repoFilterDir, null);
+  assert.equal(s5.scopeLabel, 'session=t155');
+  const s5b = resolveTuiScope({ sessionId: 't155', repoDir: '/x/my-repo' }, envOther, cwd);
+  assert.equal(s5b.repoFilterDir, path.resolve('/x/my-repo'));
+});
+
+test('20. matchesSessionScope — 같은 레포 안 두 세션(t155/t182) 자식 워커 격리', () => {
+  const t155 = { address: 't155', agent: 'pi', state: 'live', status: 'working' };
+  const w1 = { address: 'w-1', agent: 'pi', name: 'w-coder1', parent: 't155', state: 'live' };
+  const t182 = { address: 't182', agent: 'pi', state: 'live', status: 'working' };
+  const w2 = { address: 'w-2', agent: 'claude', name: 'w-coder2', parent: 't182', state: 'live' };
+
+  // 스코프 미지정 — 전역 (기존 동작 100% 불변)
+  assert.equal(matchesSessionScope(t155, undefined), true);
+  assert.equal(matchesSessionScope(w2, undefined), true);
+
+  // t155 스코프 — t155 본인 + 자식 w-1만, t182/w-2는 제외
+  assert.equal(matchesSessionScope(t155, 't155'), true);
+  assert.equal(matchesSessionScope(w1, 't155'), true);
+  assert.equal(matchesSessionScope(t182, 't155'), false);
+  assert.equal(matchesSessionScope(w2, 't155'), false);
+
+  // t182 스코프 — 반대 격리
+  assert.equal(matchesSessionScope(t182, 't182'), true);
+  assert.equal(matchesSessionScope(w2, 't182'), true);
+  assert.equal(matchesSessionScope(t155, 't182'), false);
+  assert.equal(matchesSessionScope(w1, 't182'), false);
+});
+
+test('21. createLiveRosterSyncer sessionId — 같은 레포 내 타 세션 워커 필터, 미지정 시 전부', async () => {
+  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lws-sess-')));
+  const env = isolateRosterEnv(tmp);
+  const rosterPath = path.join(tmp, 'roster.json');
+  process.env.HERDR_ROSTER_PATH = rosterPath;
+  writeTempRoster(rosterPath, 't-sess-prof', 'claude', 'claude-sonnet-4-6');
+
+  // 같은 레포(cwd 동일) 안에 t155+w-1, t182+w-2 두 세션
+  const repoDir = path.join(tmp, 'my-repo');
+  fs.mkdirSync(repoDir, { recursive: true });
+  const lsJson = JSON.stringify({
+    terminals: [
+      { address: 't155', agent: 'pi', state: 'live', status: 'working', cwd: repoDir },
+      { address: 'w-1', agent: 'pi', name: 'w-coder1', parent: 't155', state: 'live', status: 'working', cwd: repoDir },
+      { address: 't182', agent: 'pi', state: 'live', status: 'working', cwd: repoDir },
+      { address: 'w-2', agent: 'claude', name: 'w-coder2', parent: 't182', state: 'live', status: 'working', cwd: repoDir },
+    ],
+  });
+
+  const makeRunner = (): Parameters<typeof createLiveRosterSyncer>[0]['execRunner'] =>
+    async (_file, args) => {
+      if (args[0] === 'ls') return lsJson;
+      if (args[0] === 'get') return JSON.stringify({});
+      return '';
+    };
+
+  const updates: MergedLiveRoster[] = [];
+  const syncer = createLiveRosterSyncer({
+    repoDir: tmp,
+    repoFilterDir: null,
+    sessionId: 't155',
+    getWatchedLead: () => null,
+    onUpdate: (m) => updates.push(m),
+    intervalMs: 25,
+    execRunner: makeRunner(),
+  });
+  try {
+    await waitFor(() => updates.length >= 1 && updates[updates.length - 1]!.workers.length >= 2);
+    const addrs = updates[updates.length - 1]!.workers.map((w) => w.address).sort();
+    assert.deepEqual(addrs, ['t155', 'w-1'], '같은 레포라도 t155 세션만 관측');
+  } finally {
+    syncer.stop();
+  }
+
+  // sessionId 미지정(전역/--all) — 같은 조건에서 4개 전부 관측
+  const updatesAll: MergedLiveRoster[] = [];
+  const syncerAll = createLiveRosterSyncer({
+    repoDir: tmp,
+    repoFilterDir: null,
+    getWatchedLead: () => null,
+    onUpdate: (m) => updatesAll.push(m),
+    intervalMs: 25,
+    execRunner: makeRunner(),
+  });
+  try {
+    await waitFor(() => updatesAll.length >= 1 && updatesAll[updatesAll.length - 1]!.workers.length >= 4);
+    const addrs = updatesAll[updatesAll.length - 1]!.workers.map((w) => w.address).sort();
+    assert.deepEqual(addrs, ['t155', 't182', 'w-1', 'w-2'], '세션 필터 없으면 전부 관측');
+  } finally {
+    syncerAll.stop();
     env.restore();
     fs.rmSync(tmp, { recursive: true, force: true });
   }

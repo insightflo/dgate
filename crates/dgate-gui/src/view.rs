@@ -28,6 +28,14 @@
 //!   없다.
 //! - 반응형 — viewport 폭에 따라 Advisor/Pipeline·Lead/Verifier 스택킹(960px)과
 //!   워커 그리드 열 상한(820px 기준 2열)이 바뀐다(640px까지 자유 리사이즈).
+//! - Zed 스타일 스플리터 3종 — Advisor 폭(세로)·Verifier 폭(와이어 영역 세로)·
+//!   세션 기록 높이(가로)를 마우스 드래그로 조절하고 더블클릭으로 기본값 복귀.
+//!   크기 상태는 스냅숏과 무관한 `PanelSizes`(폴링 사이 불변 → 드래그 중 점프 없음)
+//!   이고 드래그 추적은 루트 컨테이너의 mouse_move/mouse_up이 담당한다.
+//! - 역할별 다중 세션 — 같은 레포에도 lead/verifier/advisor 세션이 여러 개 떠 있을
+//!   수 있어 각자 박스에 주소(t155/t182/t165…)로 구분해 나열하고 Workers 그리드는
+//!   하위 워커(sub_workers)만 그린다(역할 세션 중복 배치 금지). 부모 매핑은
+//!   `hc ls --json`의 parent 필드에서 유도해 '← 부모' pill로 표시한다.
 //! - 수직 컴팩트 — 780px 창 높이에 헤더→푸터 전체가 한 화면으로 들어온다
 //!   (overflow_y_scroll은 창을 매우 줄였을 때의 안전 폴백으로만 남아 있다).
 //! - 대기 상태(워커 0)에는 가짜 진행·애니메이션을 두지 않는다 — 침착한 청사진 슬롯.
@@ -37,14 +45,16 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, relative, Context, FontWeight, Pixels, Render, Rgba, SharedString, Window,
+    div, prelude::*, px, relative, Context, FontWeight, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Render, Rgba, SharedString, Window,
 };
 
 use crate::state::{
     continuous_phase, format_elapsed_mmss, has_active_work, kill_worker_safe,
-    lead_display_count, smooth_pulse_opacity, visible_worker_columns, DashboardController,
-    DashboardSnapshot, DefaultKillExecutor, DecisionLabel, GuiCliOptions, LogPanelSize,
-    PollerHandle, RecentLogEntry, RouteMetric, ACTIVE_ANIM_FRAME_MS, UI_REFRESH_TICK_MS,
+    lead_display_count, partition_sessions_by_role, smooth_pulse_opacity,
+    visible_worker_columns, DashboardController, DashboardSnapshot, DefaultKillExecutor,
+    DecisionLabel, DragTarget, GuiCliOptions, LogPanelSize, PollerHandle, RecentLogEntry,
+    RouteMetric, ACTIVE_ANIM_FRAME_MS, UI_REFRESH_TICK_MS,
 };
 use dgate_core::live_sync::LiveWorkerInfo;
 use dgate_core::redact::redact_secrets;
@@ -112,6 +122,9 @@ pub struct DashboardView {
     pub anim_secs: f32,
     /// anim_secs의 기준 시각 — 프레임마다 elapsed로 환산(누적 오차 없는 벽시계).
     pub anim_epoch: Instant,
+    /// 진행 중인 스플리터 드래그 — (대상 축, 드래그 시작 마우스 축 좌표, 시작 크기).
+    /// None이면 유휴 — 루트의 mouse_move 리스너는 아무 일도 하지 않는다.
+    pub active_drag: Option<(DragTarget, f32, f32)>,
 }
 
 impl DashboardView {
@@ -194,7 +207,14 @@ impl DashboardView {
             hc_bin: "hc".to_string(),
             anim_secs: 0.0,
             anim_epoch: Instant::now(),
+            active_drag: None,
         }
+    }
+
+    /// 스플리터 드래그 시작 — 현재 크기를 기준으로 찍는다(이후 이동량은 순수 델타).
+    fn begin_panel_drag(&mut self, target: DragTarget, start_mouse_axis_px: f32) {
+        let start_size = self.controller.panel_sizes.value_of(target);
+        self.active_drag = Some((target, start_mouse_axis_px, start_size));
     }
 
     // -----------------------------------------------------------------------
@@ -230,8 +250,9 @@ impl DashboardView {
             });
 
         // 라이브 카운터 — TUI 헤더 우측 4색 카운터의 역할별 live 세션 수.
-        // LEAD는 부모 오케스트레이터라 자식 터미널 로스터에 안 나오므로
-        // lead_display_count로 Lead 카드 상태(워커 조율 중/대기 중)와 항상 일치시킨다.
+        // 역할별 세션 분할 기준 — LEAD는 아래 lead_display_count 계약(하위 워커
+        // 실행 중이면 최소 1), WORKERS는 sub_workers(explore·coder·기타)만 센다.
+        let parts = partition_sessions_by_role(&snap.workers);
         let counters = div()
             .flex()
             .flex_1()
@@ -241,9 +262,9 @@ impl DashboardView {
             .gap_3()
             .overflow_hidden()
             .child(counter_label("LEAD", lead_display_count(snap), LEAD_ORANGE))
-            .child(counter_label("WORKERS", worker_count(snap), WORKER_BLUE))
-            .child(counter_label("VERIFIES", live_count(snap, "verifier"), VERIFIER_NEON))
-            .child(counter_label("ADVISOR", live_count(snap, "advisor"), ADVISOR_PURPLE));
+            .child(counter_label("WORKERS", parts.sub_workers.len(), WORKER_BLUE))
+            .child(counter_label("VERIFIES", parts.verifiers.len(), VERIFIER_NEON))
+            .child(counter_label("ADVISOR", parts.advisors.len(), ADVISOR_PURPLE));
 
         // 우측 컨트롤 — LIVE/DEMO 토글 · 새로고침 · 일시정지 · 제어 허용
         let mut right = div().flex().flex_row().items_center().gap_2();
@@ -473,7 +494,8 @@ impl DashboardView {
     ) -> gpui::Stateful<gpui::Div> {
         let advisor = self.render_advisor_panel(snap, vw);
         let pipeline = self.render_pipeline(snap, cx, vw);
-        // 반응형 본문 — 넓은 창(≥960px) 2단 나란히 / 좁은 창 Advisor 위 스택.
+        // 반응형 본문 — 넓은 창(≥960px) 2단 나란히(사이에 드래그 스플리터) /
+        // 좁은 창 Advisor 위 스택(스플리터 없음).
         let body = if vw < px(960.) {
             div()
                 .flex()
@@ -490,6 +512,7 @@ impl DashboardView {
                 .gap_3()
                 .w_full()
                 .child(advisor)
+                .child(self.render_advisor_splitter(cx))
                 .child(pipeline)
         };
         div()
@@ -509,6 +532,7 @@ impl DashboardView {
             .workers
             .iter()
             .any(|w| w.slot.as_str() == "advisor" && worker_running(w));
+        let advisors = partition_sessions_by_role(&snap.workers).advisors;
         let active = self.controller.demo_mode || advisor_running;
         let border = if active { ADVISOR_PURPLE } else { BORDER_ADVISORY_IDLE };
         let model = role_model_label(snap, "advisor");
@@ -562,16 +586,15 @@ impl DashboardView {
             .bg(if active { BG_GLOW_PURPLE } else { BG_ELEVATED })
             .border_1()
             .border_color(border);
-        // 반응형 폭 — 넓은 창 고정 폭 사이드 패널 / 좁은 창 전체 폭.
+        // 반응형 폭 — 넓은 창 드래그 가능 고정 폭 사이드 패널 / 좁은 창 전체 폭.
         panel = if vw < px(960.) {
             panel.w_full()
         } else {
             panel
-                .min_w(px(260.))
-                .max_w(px(300.))
-                .flex_basis(relative(0.24))
+                .w(px(self.controller.panel_sizes.advisor_width))
+                .flex_shrink_0()
         };
-        panel
+        panel = panel
             .child(
                 div()
                     .flex()
@@ -590,7 +613,25 @@ impl DashboardView {
                     .text_color(if active { ADVISOR_PURPLE } else { MUTED })
                     .truncate()
                     .child(model),
-            )
+            );
+        // 명시적 advisor 세션 — 자문 카드 위에 세션마다 고정 높이 1행(주소 구분).
+        // 동일 레포에 여러 자문 세션이 떠 있어도 각자 보인다.
+        for (i, w) in advisors.iter().enumerate() {
+            let elapsed = self
+                .controller
+                .worker_elapsed_secs(&w.address, Some(i))
+                .map(format_elapsed_mmss);
+            panel = panel.child(role_session_row(
+                w,
+                i,
+                ADVISOR_PURPLE,
+                elapsed,
+                self.anim_secs,
+                false,
+                true,
+            ));
+        }
+        panel
             // 자문 게이트 3종 — 활성 게이트 배지는 사인 호흡(대기 정지)
             .child(advisor_gate(
                 true,
@@ -659,28 +700,32 @@ impl DashboardView {
     }
 
     /// 우측 4단 파이프라인 — Lead+Verifier → Decision Gate → Workers → 다시 Lead.
-    /// 커넥터 스템 수는 보이는 워커 열 수와 정확히 일치한다(동적 N스템).
+    /// 커넥터 스템 수는 하위 워커(sub_workers) 수와 정확히 일치한다(동적 N스템) —
+    /// 리드/검증/자문 세션은 각자의 박스에만 나타나고 그리드로 중복 배치되지 않는다.
     fn render_pipeline(&self, snap: &DashboardSnapshot, cx: &Context<Self>, vw: Pixels) -> gpui::Div {
+        // 하위 워커만 그리드에 — 역할별 분할로 리드/검증/자문 세션을 제외한다.
+        let sub_workers = partition_sessions_by_role(&snap.workers).sub_workers;
         // 보이는 워커 열 수 — 좁은 창(<820px)은 2열 상한(카드 가독성), 넓으면 최대 4열.
         let col_cap = if vw < px(820.) { 2 } else { 4 };
-        let cols = if snap.workers.is_empty() {
+        let cols = if sub_workers.is_empty() {
             // 라이브 0 — 3슬롯 청사진(뷰포트와 무관한 침묵 3스템 토폴로지)
             visible_worker_columns(0)
         } else {
-            visible_worker_columns(snap.workers.len()).min(col_cap)
+            visible_worker_columns(sub_workers.len()).min(col_cap)
         };
         // 첫 행(최대 cols) 슬롯별 활성 플래그 — 활성 스템만 밝게, 대기 스템은 뮤트.
-        let stem_flags: Vec<bool> = if snap.workers.is_empty() {
+        let stem_flags: Vec<bool> = if sub_workers.is_empty() {
             vec![false; cols]
         } else {
-            snap.workers
+            sub_workers
                 .iter()
                 .take(cols)
                 .map(|w| worker_running(w))
                 .collect()
         };
 
-        // Stage 1 — Lead 메인 ↔ Verifier 교차 검증 (넓은 창: 수평 나란히 / 좁은 창: 스택)
+        // Stage 1 — Lead 메인 ↔ Verifier 교차 검증 (넓은 창: 수평 나란히 — 와이어 전체가
+        // Verifier 폭 드래그 핸들 / 좁은 창: 스택, 핸들 없음)
         let stage1 = if vw < px(960.) {
             div()
                 .flex()
@@ -698,10 +743,7 @@ impl DashboardView {
                 .flex_row()
                 .gap_1()
                 .child(self.render_lead_card(snap))
-                .child(horizontal_wire(
-                    self.verifier_motion(snap),
-                    self.anim_secs,
-                ))
+                .child(self.render_verifier_drag_handle(snap, cx))
                 .child(self.render_verifier_card(snap, vw))
         };
 
@@ -722,12 +764,125 @@ impl DashboardView {
                 cols,
                 &stem_flags,
                 self.anim_secs,
-                snap.workers.len(),
+                sub_workers.len(),
             ))
-            .child(self.render_workers_section(snap, cx, cols))
+            .child(self.render_workers_section(snap, cx, &sub_workers, cols))
             .child(converging_connector(cols, &stem_flags, self.anim_secs))
             // Stage 4 — 다시 Lead · 리드
             .child(self.render_back_bar(snap))
+    }
+
+    // -----------------------------------------------------------------------
+    // 3b. Zed 스타일 스플리터 — 드래그 리사이즈 핸들 3종 (더블클릭 리셋)
+    // -----------------------------------------------------------------------
+
+    /// Advisor|Pipeline 세로 스플리터(≥960px에서만 표시) — 오른쪽 드래그로 Advisor
+    /// 폭 확장, 더블클릭 기본폭 복귀. 핸들 자체가 고정 8px 트랙이라 드래그 중에도
+    /// 레이아웃 지오메트리는 일정하다(무지터).
+    fn render_advisor_splitter(&self, cx: &Context<Self>) -> gpui::Div {
+        let dragging =
+            matches!(self.active_drag, Some((DragTarget::AdvisorWidth, _, _)));
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .w(px(8.))
+            .flex_none()
+            .rounded_sm()
+            .border_1()
+            .border_color(BORDER_WIRE)
+            .cursor_ew_resize()
+            .hover(|s| s.bg(BG_GLOW_PURPLE))
+            .when(dragging, |el| el.bg(BG_GLOW_PURPLE))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                    if ev.click_count >= 2 {
+                        this.controller.reset_panel(DragTarget::AdvisorWidth);
+                    } else {
+                        this.begin_panel_drag(DragTarget::AdvisorWidth, f32::from(ev.position.x));
+                    }
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .w(px(2.))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(if dragging { ADVISOR_PURPLE } else { BORDER_ADVISORY_IDLE }),
+            )
+    }
+
+    /// Lead↔Verifier 와이어 전체를 Verifier 폭 드래그 핸들로(≥960px) — 왼쪽 드래그로
+    /// Verifier 확장, 더블클릭 기본폭 복귀. 와이어 애니메이션은 그대로 살아있다.
+    fn render_verifier_drag_handle(
+        &self,
+        snap: &DashboardSnapshot,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
+        let dragging =
+            matches!(self.active_drag, Some((DragTarget::VerifierWidth, _, _)));
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .min_w(px(44.))
+            .flex_none()
+            .rounded_sm()
+            .cursor_ew_resize()
+            .hover(|s| s.bg(BG_GLOW_NEON))
+            .when(dragging, |el| el.bg(BG_GLOW_NEON))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                    if ev.click_count >= 2 {
+                        this.controller.reset_panel(DragTarget::VerifierWidth);
+                    } else {
+                        this.begin_panel_drag(DragTarget::VerifierWidth, f32::from(ev.position.x));
+                    }
+                    cx.notify();
+                }),
+            )
+            .child(horizontal_wire(self.verifier_motion(snap), self.anim_secs))
+    }
+
+    /// 세션 기록 상단 가로 스플리터 — 위로 드래그하면 패널이 높아지고 더블클릭 시
+    /// 기본 높이로 복귀. 48px 알약 그립은 드래그 중 GATE_GREEN으로 켜진다.
+    fn render_log_splitter(&self, cx: &Context<Self>) -> gpui::Div {
+        let dragging = matches!(self.active_drag, Some((DragTarget::LogHeight, _, _)));
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .mx_4()
+            .h(px(8.))
+            .flex_none()
+            .rounded_sm()
+            .cursor_ns_resize()
+            .hover(|s| s.bg(BG_GREEN_TRACK))
+            .when(dragging, |el| el.bg(BG_GREEN_TRACK))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                    if ev.click_count >= 2 {
+                        this.controller.reset_panel(DragTarget::LogHeight);
+                    } else {
+                        this.begin_panel_drag(DragTarget::LogHeight, f32::from(ev.position.y));
+                    }
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .w(px(48.))
+                    .h(px(2.))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(if dragging { GATE_GREEN } else { BORDER_WIRE }),
+            )
     }
 
     /// Verifier 모션 여부 — verifier 실행 중이거나 DEMO 미리보기.
@@ -746,13 +901,15 @@ impl DashboardView {
     }
 
     /// Stage 1 좌측 — Lead 카드. 모션: lead 실행 중 또는 하위 워커 실행 중 / DEMO.
+    /// 명시적 lead 세션이 있으면 세션마다 고정 높이 1행(주소로 구분 — 동일 레포
+    /// 다중 lead도 각자 보인다), 없으면 기존 폴백(조율 중/대기 중) 표기.
     fn render_lead_card(&self, snap: &DashboardSnapshot) -> gpui::Div {
+        let parts = partition_sessions_by_role(&snap.workers);
         let model = role_model_label(snap, "lead");
-        let subordinates_running = snap
-            .workers
-            .iter()
-            .any(|w| w.slot.as_str() != "lead" && worker_running(w));
-        let motion = self.controller.demo_mode || lead_active(snap) || subordinates_running;
+        let subordinates_running = parts.sub_workers.iter().any(|w| worker_running(w));
+        let motion = self.controller.demo_mode
+            || parts.leads.iter().any(|w| worker_running(w))
+            || subordinates_running;
         let state_pill = if motion {
             spinner_pill(
                 spinner_char(self.anim_secs, 0),
@@ -767,11 +924,7 @@ impl DashboardView {
         } else {
             pill("대기 중", MUTED, BG)
         };
-        let activity = match snap.workers.iter().find(|w| w.slot.as_str() == "lead") {
-            Some(w) => redact_secrets(&w.activity),
-            None => "계획 수립·워커 배차 대기".to_string(),
-        };
-        div()
+        let mut card = div()
             .flex()
             .flex_col()
             .gap_1()
@@ -799,28 +952,56 @@ impl DashboardView {
                     )
                     .child(div().flex_1())
                     .child(state_pill),
-            )
-            .child(
-                div()
-                    .h(px(16.))
-                    .text_size(px(10.))
-                    .text_color(TEXT_SOFT)
-                    .truncate()
-                    .child(activity),
-            )
-            .child(
-                div()
-                    .h(px(14.))
-                    .text_size(px(10.))
-                    .text_color(MUTED)
-                    .truncate()
-                    .child(format!("effort ▮▮▮▮ · profile={}", snap.profile_name)),
-            )
+            );
+        if parts.leads.is_empty() {
+            // 세션 없음 폴백 — 기존 단일 카드 표기(활동 1줄 + effort/profile).
+            let activity = match snap.workers.iter().find(|w| w.slot.as_str() == "lead") {
+                Some(w) => redact_secrets(&w.activity),
+                None => "계획 수립·워커 배차 대기".to_string(),
+            };
+            card = card
+                .child(
+                    div()
+                        .h(px(16.))
+                        .text_size(px(10.))
+                        .text_color(TEXT_SOFT)
+                        .truncate()
+                        .child(activity),
+                )
+                .child(
+                    div()
+                        .h(px(14.))
+                        .text_size(px(10.))
+                        .text_color(MUTED)
+                        .truncate()
+                        .child(format!("effort ▮▮▮▮ · profile={}", snap.profile_name)),
+                );
+        } else {
+            for (i, w) in parts.leads.iter().enumerate() {
+                let elapsed = self
+                    .controller
+                    .worker_elapsed_secs(&w.address, Some(i))
+                    .map(format_elapsed_mmss);
+                card = card.child(role_session_row(
+                    w,
+                    i,
+                    LEAD_ORANGE,
+                    elapsed,
+                    self.anim_secs,
+                    true,
+                    true,
+                ));
+            }
+        }
+        card
     }
 
     /// Stage 1 우측 — Verifier 교차 검증 카드. 모션: verifier 실행 중 / DEMO.
     /// 좁은 창(<960px)에서는 전체 폭으로 Lead 아래 스택된다.
+    /// 명시적 verifier 세션이 있으면 세션마다 (메타행 + 네온 슬라이딩 바 + 활동 1줄)
+    /// 블록으로 나열 — 동일 레포 다중 검증 세션도 주소로 구분된다.
     fn render_verifier_card(&self, snap: &DashboardSnapshot, vw: Pixels) -> gpui::Div {
+        let parts = partition_sessions_by_role(&snap.workers);
         let active = self.verifier_motion(snap);
         let model = role_model_label(snap, "verifier");
         let badge_pill = if active {
@@ -832,11 +1013,6 @@ impl DashboardView {
             )
         } else {
             pill("대기", MUTED, BG)
-        };
-        let (status_label, status_color) = if active {
-            ("◉ 계획·결과 교차 검토", VERIFIER_NEON)
-        } else {
-            ("○ 교차 검증 대기", MUTED)
         };
         let mut card = div()
             .flex()
@@ -850,42 +1026,81 @@ impl DashboardView {
         card = if vw < px(960.) {
             card.w_full()
         } else {
-            card.w(px(260.))
+            card.w(px(self.controller.panel_sizes.verifier_width)).flex_shrink_0()
         };
-        card
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .min_h(px(18.))
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(if active { VERIFIER_NEON } else { TEXT_SOFT })
-                            .truncate()
-                            .child(format!("Verifier · {}", model)),
-                    )
-                    .child(div().flex_1())
-                    .child(badge_pill),
-            )
+        card = card.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .min_h(px(18.))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(if active { VERIFIER_NEON } else { TEXT_SOFT })
+                        .truncate()
+                        .child(format!("Verifier · {}", model)),
+                )
+                .child(div().flex_1())
+                .child(badge_pill),
+        );
+        if parts.verifiers.is_empty() {
             // 진행 트랙 — 활성: 네온 알약이 좌↔우 글라이드 / 대기: 빈 트랙(위장 금지).
             // 높이는 양쪽 다 5px 고정 — 카드 높이 점프 없음.
-            .child(if active {
-                sliding_pill_track(BG_NEON_TRACK, VERIFIER_NEON, self.anim_secs, 0)
-            } else {
-                div().flex().w_full().h(px(5.)).flex_none().rounded_full().bg(BG_NEON_TRACK)
-            })
-            .child(
-                div()
-                    .h(px(14.))
-                    .text_size(px(10.))
-                    .text_color(status_color)
-                    .truncate()
-                    .child(status_label),
-            )
+            card = card
+                .child(if active {
+                    sliding_pill_track(BG_NEON_TRACK, VERIFIER_NEON, self.anim_secs, 0)
+                } else {
+                    div().flex().w_full().h(px(5.)).flex_none().rounded_full().bg(BG_NEON_TRACK)
+                })
+                .child(
+                    div()
+                        .h(px(14.))
+                        .text_size(px(10.))
+                        .text_color(if active { VERIFIER_NEON } else { MUTED })
+                        .truncate()
+                        .child(if active {
+                            "◉ 계획·결과 교차 검토"
+                        } else {
+                            "○ 교차 검증 대기"
+                        }),
+                );
+        } else {
+            for (i, w) in parts.verifiers.iter().enumerate() {
+                let running = worker_running(w);
+                let elapsed = self
+                    .controller
+                    .worker_elapsed_secs(&w.address, Some(i))
+                    .map(format_elapsed_mmss);
+                card = card
+                    .child(role_session_row(
+                        w,
+                        i,
+                        VERIFIER_NEON,
+                        elapsed,
+                        self.anim_secs,
+                        false,
+                        false,
+                    ))
+                    // 세션별 네온 트랙 — 실행 중 글라이드 / 완료 빈 트랙(높이 5px 고정).
+                    .child(if running {
+                        sliding_pill_track(BG_NEON_TRACK, VERIFIER_NEON, self.anim_secs, i)
+                    } else {
+                        div().flex().w_full().h(px(5.)).flex_none().rounded_full().bg(BG_NEON_TRACK)
+                    })
+                    .child(
+                        div()
+                            .h(px(14.))
+                            .text_size(px(10.))
+                            .text_color(if running { VERIFIER_NEON } else { MUTED })
+                            .truncate()
+                            .child(redact_secrets(&w.activity)),
+                    );
+            }
+        }
+        card
     }
 
     /// Stage 2 — Decision Gate · 분기 계층 (라우트 확률 바 + 우측 compact 지표).
@@ -954,15 +1169,17 @@ impl DashboardView {
         panel
     }
 
-    /// Stage 3 — Workers 그리드 — 보이는 워커 수 = 열 수(1/2/3/4+, 초과 2행 랩).
+    /// Stage 3 — Workers 그리드 — 보이는 하위 워커 수 = 열 수(1/2/3/4+, 초과 2행 랩).
+    /// lead/verifier/advisor 세션은 호출부에서 이미 제외되어 여기 내려오지 않는다.
     /// 라이브 0이면 3슬롯 청사진(침묵 3스템 와이어와 동일 지오메트리).
     fn render_workers_section(
         &self,
         snap: &DashboardSnapshot,
         cx: &Context<Self>,
+        sub_workers: &[LiveWorkerInfo],
         cols: usize,
     ) -> gpui::Div {
-        if snap.workers.is_empty() {
+        if sub_workers.is_empty() {
             // 라이브 워커 0 — 침착한 청사진 슬롯 3열
             let mut grid = div().flex().flex_row();
             for slot in ["explore", "coder", "verifier"] {
@@ -973,7 +1190,7 @@ impl DashboardView {
         if cols == 1 {
             // 단일 워커 — 중앙 정렬 카드(단일 중앙 스템과 정렬, 가로 레일 없음)
             return div().flex().flex_row().justify_center().child(
-                self.render_worker_card(&snap.workers[0], cx, 0)
+                self.render_worker_card(&sub_workers[0], cx, 0, parent_of(snap, &sub_workers[0]))
                     .w_full()
                     .max_w(px(460.)),
             );
@@ -981,11 +1198,11 @@ impl DashboardView {
         // 2~4열 — 카드 flex_1·mx_1 → 셀 중심 = 스템 중심 정확 정렬.
         // cols 초과분은 cols열씩 랩하고 마지막 행 빈 열은 스페이서로 열 폭 유지.
         let mut column = div().flex().flex_col().gap_2();
-        for (row_idx, chunk) in snap.workers.chunks(cols).enumerate() {
+        for (row_idx, chunk) in sub_workers.chunks(cols).enumerate() {
             let mut row = div().flex().flex_row();
             for (i, w) in chunk.iter().enumerate() {
                 row = row.child(
-                    self.render_worker_card(w, cx, row_idx * cols + i)
+                    self.render_worker_card(w, cx, row_idx * cols + i, parent_of(snap, w))
                         .flex_1()
                         .min_w_0()
                         .mx_1(),
@@ -1000,14 +1217,16 @@ impl DashboardView {
     }
 
     /// 실행 중 워커 카드 1개 — 활동바 + 1줄 활동 + 실측 경과 타이머(mm:ss) +
-    /// (제어 허용 시) 2단계 중단 버튼. idx는 보이는 그리드 순서 — 스피너·슬라이딩
-    /// 알약 위상을 워커마다 흩는다. 모든 줄이 고정 높이(truncate)라 형제 카드·연속
-    /// 프레임 사이에 세로 1px 흔들림도 없다. 폭 설정은 호출부에서 결정한다.
+    /// (제어 허용 시) 2단계 중단 버튼 + (부모 있으면) '← 부모 주소' pill. idx는 보이는
+    /// 그리드 순서 — 스피너·슬라이딩 알약 위상을 워커마다 흩는다. 모든 줄이 고정
+    /// 높이(truncate)라 형제 카드·연속 프레임 사이에 세로 1px 흔들림도 없다.
+    /// 폭 설정은 호출부에서 결정한다.
     fn render_worker_card(
         &self,
         w: &LiveWorkerInfo,
         cx: &Context<Self>,
         idx: usize,
+        parent: Option<&str>,
     ) -> gpui::Div {
         let confirming = self.controller.confirm_kill_address.as_deref() == Some(w.address.as_str());
         let can_control = self.controller.control_enabled
@@ -1225,6 +1444,25 @@ impl DashboardView {
                                 None => "✓ 완료".to_string(),
                             })
                     })
+                    // 부모 리드 표시 — 어느 Lead 세션이 이 워커를 스폰했는지(미상 생략).
+                    .when(parent.is_some(), |el| {
+                        el.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .px_1()
+                                .h(px(14.))
+                                .flex_none()
+                                .max_w(px(84.))
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(BORDER_WIRE)
+                                .text_size(px(9.))
+                                .text_color(MUTED)
+                                .truncate()
+                                .child(format!("← {}", parent.unwrap_or_default())),
+                        )
+                    })
                     .child(div().flex_1())
                     .child(actions),
             )
@@ -1288,6 +1526,7 @@ impl DashboardView {
 
     fn render_session_log(&self, snap: &DashboardSnapshot, cx: &Context<Self>) -> gpui::Div {
         let size = self.controller.log_panel_size;
+        let rows = self.controller.panel_sizes.visible_log_rows();
         let mut panel = div()
             .flex()
             .flex_col()
@@ -1296,6 +1535,9 @@ impl DashboardView {
             .mb_2()
             .p_2()
             .flex_none()
+            // 드래그 가능 고정 높이 — 상단 스플리터가 이 값을 움직인다. 높이에는
+            // 헤더 크롬(~34px)이 포함되고 본문은 내부 스크롤로 창을 밀어내지 않는다.
+            .h(px(self.controller.panel_sizes.log_height))
             .rounded_lg()
             .bg(BG_ELEVATED)
             .border_1()
@@ -1342,54 +1584,32 @@ impl DashboardView {
                             .child("decision_events · 읽기전용 조회"),
                     ),
             );
-        match size {
-            LogPanelSize::Collapsed => {
-                // 접힘 — 헤더 바만 남는다(1줄 높이).
+        if rows == 0 {
+            // 접힘 — 헤더 바만 남는다(높이 34px = 패딩+헤더).
+        } else if snap.recent_log.is_empty() {
+            panel = panel.child(
+                div()
+                    .h(px(16.))
+                    .text_size(px(10.))
+                    .text_color(MUTED)
+                    .truncate()
+                    .child("아직 기록된 결정 이벤트가 없습니다"),
+            );
+        } else {
+            // 펼침 — 높이 예산(20px/줄)만큼의 줄을 내부 스크롤 창에 올린다.
+            // 패널 높이가 고정이라 창 밖으로 밀어내지 않고 스크롤로 흡수한다.
+            let mut body = div()
+                .id("session-log-body")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll();
+            for e in snap.recent_log.iter().take(rows) {
+                body = body.child(log_line(e));
             }
-            LogPanelSize::Compact => {
-                // 작게(기본) — 3줄 고정 높이 본문.
-                if snap.recent_log.is_empty() {
-                    panel = panel.child(
-                        div()
-                            .h(px(16.))
-                            .text_size(px(10.))
-                            .text_color(MUTED)
-                            .truncate()
-                            .child("아직 기록된 결정 이벤트가 없습니다"),
-                    );
-                } else {
-                    let mut body = div().flex().flex_col().gap_1();
-                    for e in snap.recent_log.iter().take(size.visible_lines()) {
-                        body = body.child(log_line(e));
-                    }
-                    panel = panel.child(body);
-                }
-            }
-            LogPanelSize::Expanded => {
-                // 크게 — 8줄 창 + 내부 스크롤(패널 자체는 창을 밀어내지 않는다).
-                if snap.recent_log.is_empty() {
-                    panel = panel.child(
-                        div()
-                            .h(px(16.))
-                            .text_size(px(10.))
-                            .text_color(MUTED)
-                            .truncate()
-                            .child("아직 기록된 결정 이벤트가 없습니다"),
-                    );
-                } else {
-                    let mut body = div()
-                        .id("session-log-body")
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .max_h(px(size.visible_lines() as f32 * 17.0 + 4.0))
-                        .overflow_y_scroll();
-                    for e in snap.recent_log.iter() {
-                        body = body.child(log_line(e));
-                    }
-                    panel = panel.child(body);
-                }
-            }
+            panel = panel.child(body);
         }
         panel
     }
@@ -1486,9 +1706,40 @@ impl Render for DashboardView {
             .size_full()
             .bg(BG)
             .text_color(TEXT)
+            // 스플리터 드래그 추적 — 루트가 창 전체를 커버해 드래그 중 마우스가
+            // 패널 밖으로 나가도 축 이동량을 놓치지 않는다(유휴 시 0비용 분기).
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                if let Some((target, start_pos, start_val)) = this.active_drag {
+                    let current = match target {
+                        DragTarget::LogHeight => f32::from(ev.position.y),
+                        DragTarget::AdvisorWidth | DragTarget::VerifierWidth => {
+                            f32::from(ev.position.x)
+                        }
+                    };
+                    this.controller.apply_panel_drag(target, start_val, current - start_pos);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    if this.active_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    if this.active_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .child(self.render_header(&snap, cx))
             .child(self.render_legend_strip(&snap, cx))
             .child(self.render_topology_canvas(&snap, cx, vw))
+            .child(self.render_log_splitter(cx))
             .child(self.render_session_log(&snap, cx))
             .child(self.render_footer(&snap))
     }
@@ -1503,9 +1754,104 @@ fn live_count(snap: &DashboardSnapshot, slot: &str) -> usize {
     snap.workers.iter().filter(|w| w.slot.as_str() == slot).count()
 }
 
-/// WORKERS 카운터 — explore + coder 슬롯의 live 세션 수.
-fn worker_count(snap: &DashboardSnapshot) -> usize {
-    live_count(snap, "explore") + live_count(snap, "coder")
+/// 워커의 부모(스폰 리드) 주소 조회 — 스냅숏 parent_map에서(미상 None).
+fn parent_of<'a>(snap: &'a DashboardSnapshot, w: &LiveWorkerInfo) -> Option<&'a str> {
+    snap.parent_map.get(w.address.as_str()).map(String::as_str)
+}
+
+/// 역할 박스 세션 1행 — 고정 높이(20px) 단일 줄: 스피너(고정폭) + 주소 pill +
+/// [레포] + (선택) 모델 + 경과 mm:ss + (선택) 1줄 활동(truncate). 동일 레포 다중
+/// 세션도 고유 터미널 주소(t155/t182/t165…)로 명확히 구분된다. 모든 슬롯이 고정
+/// 폭·truncate라 어떤 폭에서도 줄바꿈·높이 점프가 없다(무지터).
+fn role_session_row(
+    w: &LiveWorkerInfo,
+    idx: usize,
+    color: Rgba,
+    elapsed_label: Option<String>,
+    anim_secs: f32,
+    show_model: bool,
+    show_activity: bool,
+) -> gpui::Div {
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .min_w_0()
+        .h(px(20.))
+        .flex_none()
+        // 스피너 — 고정폭 박스(활성/비활성 전환에도 폭 흔들림 없음)
+        .child(
+            div()
+                .w(px(14.))
+                .flex_shrink_0()
+                .text_size(px(10.))
+                .text_color(color)
+                .child(spinner_char(anim_secs, idx).to_string()),
+        )
+        // 주소 pill — 세션 식별자(동일 레포 다중 세션 구분의 핵심)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px_1()
+                .h(px(16.))
+                .min_w(px(30.))
+                .max_w(px(60.))
+                .flex_none()
+                .rounded_sm()
+                .bg(BG)
+                .border_1()
+                .border_color(color)
+                .text_size(px(9.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(color)
+                .truncate()
+                .child(w.address.clone()),
+        )
+        // [레포 태그] — 고정 폭 truncate
+        .child(
+            div()
+                .w(px(76.))
+                .flex_none()
+                .text_size(px(9.))
+                .text_color(MUTED)
+                .truncate()
+                .child(format!("[{}]", w.repo_tag)),
+        );
+    if show_model {
+        row = row.child(
+            div()
+                .w(px(80.))
+                .flex_none()
+                .text_size(px(9.))
+                .text_color(TEXT_SOFT)
+                .truncate()
+                .child(w.short_model.clone()),
+        );
+    }
+    row = row.child(
+        div()
+            .w(px(38.))
+            .flex_none()
+            .text_size(px(9.))
+            .text_color(DIM)
+            .truncate()
+            .child(elapsed_label.unwrap_or_else(|| "--:--".to_string())),
+    );
+    if show_activity {
+        row = row.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(10.))
+                .text_color(TEXT_SOFT)
+                .truncate()
+                .child(redact_secrets(&w.activity)),
+        );
+    }
+    row
 }
 
 /// 워커 실행 여부 — status가 'done'이 아니면 실행 중(카드 표기·모션 공통 기준).

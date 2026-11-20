@@ -234,6 +234,19 @@ export function matchesRepoScope(
   return workerPath === scopePath || workerPath.startsWith(prefix);
 }
 
+/**
+ * 터미널이 세션 스코프 안에 있는지 판정.
+ * sessionId 미지정(undefined)이면 전역(항상 true) — 기존 동작 100% 보존.
+ * 지정 시 터미널 주소 자체 또는 parent(해당 세션이 띄운 자식 워커)가 일치할 때만 true.
+ */
+export function matchesSessionScope(
+  t: HcTerminalSummary,
+  sessionId?: string
+): boolean {
+  if (!sessionId) return true;
+  return t.address === sessionId || t.parent === sessionId;
+}
+
 // ---------- 활동 줄 추출 ----------
 
 const ANSI_OSC_RE = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
@@ -541,6 +554,8 @@ export interface LiveRosterSyncerOptions {
   repoDir: string;
   /** `--repo <dir>` 스코프 — null이면 전체 레포 관측. */
   repoFilterDir?: string | null;
+  /** `--session <id>` 스코프 — undefined면 세션 필터 없음(기존 동작 불변). */
+  sessionId?: string;
   /** 관측 중 리드 배지 제공자(있으면 lead 슬롯 라이브 오버라이드 금지). */
   getWatchedLead?: () => string | null;
   /** 병합 결과 수신자 — 매 틱 호출(변경 여부 판정은 수신자 책임). */
@@ -607,6 +622,7 @@ export function createLiveRosterSyncer(opts: LiveRosterSyncerOptions): LiveRoste
   const hcBin = opts.hcBin ?? 'hc';
   const intervalMs = opts.intervalMs ?? DEFAULT_SYNC_INTERVAL_MS;
   const repoFilterDir = opts.repoFilterDir ?? null;
+  const sessionId = opts.sessionId;
 
   let baseLabels: RosterDisplayLabels | null = null;
   let rosterSignature: string | null = null;
@@ -680,7 +696,12 @@ export function createLiveRosterSyncer(opts: LiveRosterSyncerOptions): LiveRoste
               t && typeof t === 'object' ? normalizeTerminal(t as Record<string, unknown>) : null
             )
             .filter((t): t is HcTerminalSummary => t !== null)
-            .filter((t) => isObservableTerminal(t) && matchesRepoScope(t.cwd, repoFilterDir));
+            .filter(
+              (t) =>
+                isObservableTerminal(t) &&
+                matchesRepoScope(t.cwd, repoFilterDir) &&
+                matchesSessionScope(t, sessionId)
+            );
           }
         }
       } catch {

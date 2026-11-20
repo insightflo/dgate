@@ -51,6 +51,103 @@ pub const UI_REFRESH_TICK_MS: u64 = 250;
 pub const ACTIVE_ANIM_FRAME_MS: u64 = 16;
 
 // ---------------------------------------------------------------------------
+// 패널 드래그 리사이즈 — 순수 크기 계산 (Zed 스타일 스플리터)
+// ---------------------------------------------------------------------------
+
+/// Advisor 사이드 패널 폭(px) — 기본·하한·상한.
+pub const DEFAULT_ADVISOR_WIDTH: f32 = 248.0;
+pub const MIN_ADVISOR_WIDTH: f32 = 170.0;
+pub const MAX_ADVISOR_WIDTH: f32 = 440.0;
+/// Verifier 카드 폭(px) — 기본·하한·상한.
+pub const DEFAULT_VERIFIER_WIDTH: f32 = 240.0;
+pub const MIN_VERIFIER_WIDTH: f32 = 170.0;
+pub const MAX_VERIFIER_WIDTH: f32 = 400.0;
+/// 세션 기록 패널 높이(px) — 기본·하한·상한 + '크게' 프리셋.
+pub const DEFAULT_LOG_HEIGHT: f32 = 104.0;
+pub const MIN_LOG_HEIGHT: f32 = 34.0;
+pub const MAX_LOG_HEIGHT: f32 = 380.0;
+pub const EXPANDED_LOG_HEIGHT: f32 = 224.0;
+
+/// 드래그 중인 스플리터 축 — 어느 패널 치수를 움직이는지.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragTarget {
+    /// Advisor|Pipeline 세로 스플리터(오른쪽으로 드래그 → Advisor 넓어짐).
+    AdvisorWidth,
+    /// Lead|Verifier 세로 스플리터(왼쪽으로 드래그 → Verifier 넓어짐).
+    VerifierWidth,
+    /// 세션 기록 가로 스플리터(위로 드래그 → 패널 높아짐).
+    LogHeight,
+}
+
+/// 3개 드래그 가능 패널 치수 — 뷰가 소유하는 순수 크기 상태(스냅숏과 무관하게
+/// 폴링 사이에 유지되므로 드래그 중 리셋·점프가 없다).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PanelSizes {
+    pub advisor_width: f32,
+    pub verifier_width: f32,
+    pub log_height: f32,
+}
+
+impl Default for PanelSizes {
+    fn default() -> Self {
+        PanelSizes {
+            advisor_width: DEFAULT_ADVISOR_WIDTH,
+            verifier_width: DEFAULT_VERIFIER_WIDTH,
+            log_height: DEFAULT_LOG_HEIGHT,
+        }
+    }
+}
+
+impl PanelSizes {
+    /// 드래그 델타 적용 — start_val은 드래그 시작 시점 크기, delta_px는 마우스
+    /// 축 이동량. 부호 규약: AdvisorWidth는 +델타 widen, VerifierWidth·LogHeight는
+    /// 패널이 각각 오른쪽·아래에 있어 -델타 widen. 모든 축은 [MIN, MAX]로 클램프.
+    pub fn apply_drag(&mut self, target: DragTarget, start_val: f32, delta_px: f32) {
+        match target {
+            DragTarget::AdvisorWidth => {
+                self.advisor_width =
+                    (start_val + delta_px).clamp(MIN_ADVISOR_WIDTH, MAX_ADVISOR_WIDTH);
+            }
+            DragTarget::VerifierWidth => {
+                self.verifier_width =
+                    (start_val - delta_px).clamp(MIN_VERIFIER_WIDTH, MAX_VERIFIER_WIDTH);
+            }
+            DragTarget::LogHeight => {
+                self.log_height = (start_val - delta_px).clamp(MIN_LOG_HEIGHT, MAX_LOG_HEIGHT);
+            }
+        }
+    }
+
+    /// 더블클릭 리셋 — 해당 축만 기본값으로.
+    pub fn reset(&mut self, target: DragTarget) {
+        match target {
+            DragTarget::AdvisorWidth => self.advisor_width = DEFAULT_ADVISOR_WIDTH,
+            DragTarget::VerifierWidth => self.verifier_width = DEFAULT_VERIFIER_WIDTH,
+            DragTarget::LogHeight => self.log_height = DEFAULT_LOG_HEIGHT,
+        }
+    }
+
+    /// 해당 축의 현재 값.
+    pub fn value_of(&self, target: DragTarget) -> f32 {
+        match target {
+            DragTarget::AdvisorWidth => self.advisor_width,
+            DragTarget::VerifierWidth => self.verifier_width,
+            DragTarget::LogHeight => self.log_height,
+        }
+    }
+
+    /// 현재 높이에서 보여줄 로그 줄 수 — ≤46px면 접힘(0), 그 외엔 헤더 크롬(34px)
+    /// 위의 20px/줄 예산으로 계산해 [1, 14]로 클램프.
+    pub fn visible_log_rows(&self) -> usize {
+        if self.log_height <= 46.0 {
+            0
+        } else {
+            (((self.log_height - 34.0) / 20.0).floor() as usize).clamp(1, 14)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CLI 옵션
 // ---------------------------------------------------------------------------
 
@@ -216,6 +313,9 @@ pub struct DashboardSnapshot {
     pub repo_stats: BTreeMap<String, RepoStatsBundle>,
     /// 세션 기록 패널에 올릴 최신 결정 이벤트(읽기전용 조회 + 리댁션 적용).
     pub recent_log: Vec<RecentLogEntry>,
+    /// 워커 주소 → 부모(스폰 리드) 터미널 주소 — Workers 카드 '← 부모' 표시용.
+    /// `hc ls --json`의 parent 필드에서 유도(모르는 세션은 미포함).
+    pub parent_map: HashMap<String, String>,
     /// "연결됨" | "DB 없음 (대기)" — 파일 부재에도 절대 죽지 않는다.
     pub db_status: String,
     pub hc_available: bool,
@@ -458,20 +558,57 @@ pub fn smooth_pulse_opacity(
     value.clamp(lo, hi)
 }
 
+/// 워커 세션의 역할별 분할 — 동일 프로젝트에서도 역할별로 여러 독립 세션이
+/// 떠 있을 수 있다(예: paperwork-operations에 lead 2 + coder 3). 표시·카운트는
+/// 모두 이 분할을 기준으로 해서 리드/검증/자문 세션이 Workers 그리드로
+/// 중복 배치되지 않게 한다.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RolePartitions {
+    /// lead 슬롯 세션 — Lead 박스에 각각 1행으로 나열.
+    pub leads: Vec<LiveWorkerInfo>,
+    /// verifier 슬롯 세션 — Verifier 박스에 각각 블록으로 나열.
+    pub verifiers: Vec<LiveWorkerInfo>,
+    /// advisor 슬롯 세션 — Advisor 패널 세션 목록으로 나열.
+    pub advisors: Vec<LiveWorkerInfo>,
+    /// explore·coder·그 외 전부 — Workers 그리드 전용(스템 수 = 이 길이).
+    pub sub_workers: Vec<LiveWorkerInfo>,
+}
+
+/// 워커 목록을 슬롯 기준 4역할로 분할(순수 함수 — 입력 순서 보존).
+/// slot이 'lead'·'verifier'·'advisor'가 아니면 전부 sub_workers로 간다.
+pub fn partition_sessions_by_role(workers: &[LiveWorkerInfo]) -> RolePartitions {
+    let mut parts = RolePartitions::default();
+    for w in workers {
+        match w.slot.as_str() {
+            "lead" => parts.leads.push(w.clone()),
+            "verifier" => parts.verifiers.push(w.clone()),
+            "advisor" => parts.advisors.push(w.clone()),
+            _ => parts.sub_workers.push(w.clone()),
+        }
+    }
+    parts
+}
+
 /// 헤더 LEAD [n] 카운터 표시값 — Lead 카드 상태 표기와 항상 일치시키는 판정.
-/// - lead 슬롯 실행(done 아님) 세션이 있으면 그 수(명시적 Lead 워커).
-/// - 없지만 다른 실행 워커가 있으면 1 — Lead가 부모 오케스트레이터로서
+/// - lead 슬롯 실행(done 아님) 세션이 있으면 그 수(명시적 Lead 워커 — 동일 레포
+///   여러 lead도 주소별로 전부 센다).
+/// - 없지만 하위 워커(sub_workers)가 실행 중이면 1 — Lead가 부모 오케스트레이터로서
 ///   '워커 조율 중' 상태이므로 카운터도 능동 1로 맞춘다.
-/// - 실행 워커가 전혀 없으면 0 — Lead 카드 '대기 중'과 동일.
+/// - 실행 세션이 전혀 없으면 0 — Lead 카드 '대기 중'과 동일.
 pub fn lead_display_count(snap: &DashboardSnapshot) -> usize {
-    let explicit = snap
-        .workers
+    let parts = partition_sessions_by_role(&snap.workers);
+    let explicit = parts
+        .leads
         .iter()
-        .filter(|w| w.slot.as_str() == "lead" && w.status.as_deref() != Some("done"))
+        .filter(|w| w.status.as_deref() != Some("done"))
         .count();
     if explicit > 0 {
         explicit
-    } else if snap.workers.iter().any(|w| w.status.as_deref() != Some("done")) {
+    } else if parts
+        .sub_workers
+        .iter()
+        .any(|w| w.status.as_deref() != Some("done"))
+    {
         1
     } else {
         0
@@ -551,15 +688,6 @@ pub enum LogPanelSize {
 }
 
 impl LogPanelSize {
-    /// 이 크기에서 보여줄 로그 줄 수(접힘 = 0).
-    pub fn visible_lines(self) -> usize {
-        match self {
-            LogPanelSize::Collapsed => 0,
-            LogPanelSize::Compact => 3,
-            LogPanelSize::Expanded => 8,
-        }
-    }
-
     /// 순환 헬퍼 — 접기 → 작게 → 크게 → 접기.
     pub fn next(self) -> Self {
         match self {
@@ -601,6 +729,8 @@ pub struct DashboardController {
     worker_done_elapsed: HashMap<String, u64>,
     /// 세션 기록 패널 크기 — 기본 Compact(3줄).
     pub log_panel_size: LogPanelSize,
+    /// 드래그 가능 패널 치수 — Advisor/Verifier 폭 + 세션 기록 높이.
+    pub panel_sizes: PanelSizes,
 }
 
 impl DashboardController {
@@ -617,6 +747,7 @@ impl DashboardController {
             worker_started_at: HashMap::new(),
             worker_done_elapsed: HashMap::new(),
             log_panel_size: LogPanelSize::Compact,
+            panel_sizes: PanelSizes::default(),
         }
     }
 
@@ -785,14 +916,48 @@ impl DashboardController {
             .map(|t| t.elapsed().as_secs())
     }
 
-    /// 세션 기록 패널 크기 순환 — 접기 → 작게 → 크게 → 접기.
+    /// 세션 기록 패널 크기 순환 — 접기 → 작게 → 크게 → 접기(높이도 함께 동기화).
     pub fn cycle_log_panel_size(&mut self) {
-        self.log_panel_size = self.log_panel_size.next();
+        let next = self.log_panel_size.next();
+        self.set_log_panel_size(next);
     }
 
-    /// 세션 기록 패널 크기 직접 지정(접기/작게/크게 버튼).
+    /// 세션 기록 패널 크기 직접 지정(접기/작게/크게 버튼) — 드래그 높이와 동기화.
     pub fn set_log_panel_size(&mut self, size: LogPanelSize) {
         self.log_panel_size = size;
+        self.panel_sizes.log_height = match size {
+            LogPanelSize::Collapsed => MIN_LOG_HEIGHT,
+            LogPanelSize::Compact => DEFAULT_LOG_HEIGHT,
+            LogPanelSize::Expanded => EXPANDED_LOG_HEIGHT,
+        };
+    }
+
+    /// 스플리터 드래그 — 시작 크기 + 축 이동량을 해당 패널 치수에 적용.
+    /// LogHeight가 바뀌면 프리셋 표지(log_panel_size)도 높이 구간에 맞춰 동기화.
+    pub fn apply_panel_drag(&mut self, target: DragTarget, start_val: f32, delta_px: f32) {
+        self.panel_sizes.apply_drag(target, start_val, delta_px);
+        if target == DragTarget::LogHeight {
+            self.sync_log_size_from_height();
+        }
+    }
+
+    /// 스플리터 더블클릭 리셋 — 해당 축만 기본값으로(세션 기록은 프리셋도 동기화).
+    pub fn reset_panel(&mut self, target: DragTarget) {
+        self.panel_sizes.reset(target);
+        if target == DragTarget::LogHeight {
+            self.sync_log_size_from_height();
+        }
+    }
+
+    /// log_height → 프리셋 표지 역변환 — ≤46px 접힘 · ≤150px 작게 · >150px 크게.
+    fn sync_log_size_from_height(&mut self) {
+        self.log_panel_size = if self.panel_sizes.log_height <= 46.0 {
+            LogPanelSize::Collapsed
+        } else if self.panel_sizes.log_height <= 150.0 {
+            LogPanelSize::Compact
+        } else {
+            LogPanelSize::Expanded
+        };
     }
 }
 
@@ -931,6 +1096,39 @@ fn probe_hc_available(hc_bin: &str) -> bool {
     DefaultHcRunner.exec(hc_bin, &["--version"], 700).is_ok()
 }
 
+/// `hc ls --json`에서 address→parent 매핑을 뽑는다 — 어느 리드 세션이 이 워커를
+/// 스폰했는지 카드에 '← 주소'로 보여주기 위한 읽기전용 조회. `LiveWorkerInfo`에는
+/// parent 필드가 없어 GUI 쪽에서 별도로 수집한다. 어떤 오류(hc 부재·형식 불일치)도
+/// 빈 맵 폴백 — 폴링을 절대 방해하지 않는다.
+pub fn fetch_parent_map(hc_bin: &str) -> HashMap<String, String> {
+    fetch_parent_map_with(hc_bin, &DefaultHcRunner)
+}
+
+fn fetch_parent_map_with(hc_bin: &str, exec: &dyn HcExecRunner) -> HashMap<String, String> {
+    let Ok(out) = exec.exec(hc_bin, &["ls", "--json"], 1500) else {
+        return HashMap::new();
+    };
+    let Ok(serde_json::Value::Object(root)) = serde_json::from_str(&out) else {
+        return HashMap::new();
+    };
+    let Some(serde_json::Value::Array(terminals)) = root.get("terminals") else {
+        return HashMap::new();
+    };
+    let mut map = HashMap::new();
+    for t in terminals.iter().filter_map(|t| t.as_object()) {
+        let (Some(address), Some(parent)) = (
+            t.get("address").and_then(|v| v.as_str()),
+            t.get("parent").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        if !address.is_empty() && !parent.trim().is_empty() {
+            map.insert(address.to_string(), parent.trim().to_string());
+        }
+    }
+    map
+}
+
 /// 레포 루트 목록(중복 제거, repo_tag 기준 정렬 보존) — 워커 cwd에서 유도.
 fn repo_roots_from_workers(workers: &[LiveWorkerInfo]) -> BTreeMap<String, Option<PathBuf>> {
     let mut map: BTreeMap<String, Option<PathBuf>> = BTreeMap::new();
@@ -955,6 +1153,8 @@ pub fn poll_once(cfg: &PollerConfig, snapshotter: &mut LiveSyncSnapshotter) -> D
     // 1) live hc 워커 + roster 라벨 병합(모든 hc 오류는 내부에서 조용히 폴백)
     let merged = snapshotter.tick_now();
     let workers = merged.workers.clone();
+    // 1b) 부모 매핑 — 워커 카드 '← 부모' 표시용 읽기전용 조회(오류 시 빈 맵).
+    let parent_map = fetch_parent_map(&cfg.hc_bin);
 
     // 2) roster 대기 스펙(프로필 해석은 live_sync와 동일 규칙: defaultProfile)
     let loaded = load_roster_config(cfg.roster_path.as_deref(), Some(&repo_dir));
@@ -1073,6 +1273,7 @@ pub fn poll_once(cfg: &PollerConfig, snapshotter: &mut LiveSyncSnapshotter) -> D
         shadow_summary: global_shadow,
         repo_stats,
         recent_log,
+        parent_map,
         db_status,
         hc_available: probe_hc_available(&cfg.hc_bin),
     }
@@ -1082,8 +1283,9 @@ pub fn poll_once(cfg: &PollerConfig, snapshotter: &mut LiveSyncSnapshotter) -> D
 // DEMO 시뮬레이션 스냅숏 — TUI 5계층 토폴로지 미리보기 (`--demo` · LIVE/DEMO 토글)
 // ---------------------------------------------------------------------------
 
-/// 세션 기록 패널에 올리는 최대 이벤트 수 (TUI 하단 패널 6~8줄과 동일 규모).
-pub const RECENT_LOG_LIMIT: usize = 8;
+/// 세션 기록 패널에 올리는 최대 이벤트 수 — 드래그로 최대 14줄까지 펼칠 수
+/// 있으므로 여유를 두고 16건까지 조회한다(DEMO 미리보기와 LIVE 공통 상한).
+pub const RECENT_LOG_LIMIT: usize = 16;
 
 /// 데모용 live 워커 카드 — 주소 고정(활동바 안정 채움 계산에 사용).
 fn demo_worker(slot: RoleSlot, name: &str, activity: &str, short_model: &str) -> LiveWorkerInfo {
@@ -1280,6 +1482,10 @@ pub fn demo_snapshot() -> DashboardSnapshot {
         timing_summary: Some(timing),
         shadow_summary: Some(shadow),
         recent_log,
+        parent_map: HashMap::from([
+            ("demo-w-explore-1".to_string(), "demo-w-lead-1".to_string()),
+            ("demo-w-coder-1".to_string(), "demo-w-lead-1".to_string()),
+        ]),
         db_status: "DEMO 시뮬레이션".to_string(),
         hc_available: true,
     }
@@ -1542,6 +1748,7 @@ mod tests {
             shadow_summary: None,
             repo_stats,
             recent_log: vec![],
+            parent_map: HashMap::new(),
             db_status: "연결됨".to_string(),
             hc_available: true,
         }
@@ -2305,25 +2512,279 @@ mod tests {
         assert_eq!(lead_display_count(&snap), 1);
     }
 
+    // ---------- 역할별 세션 분할 (다중 독립 세션 아키텍처) ----------
+
+    #[test]
+    fn partition_sessions_by_role_buckets_all_slots() {
+        // 동일 레포(paperwork)에 lead 2 · verifier 1 · advisor 1 · sub 3이 섞여 있어도
+        // 주소 기준으로 정확히 4역할로 분할된다(입력 순서 보존).
+        let mk = |addr: &str, slot: RoleSlot, repo: &str| LiveWorkerInfo {
+            slot,
+            address: addr.to_string(),
+            repo_tag: repo.to_string(),
+            ..worker(addr, addr, repo, None)
+        };
+        let workers = vec![
+            mk("t155", RoleSlot::Lead, "paperwork-operations"),
+            mk("t900", RoleSlot::Coder, "paperwork-operations"),
+            mk("t182", RoleSlot::Verifier, "paperwork-operations"),
+            mk("t901", RoleSlot::Explore, "other-repo"),
+            mk("t165", RoleSlot::Lead, "paperwork-operations"),
+            mk("t902", RoleSlot::Advisor, "other-repo"),
+            mk("t903", RoleSlot::Coder, "paperwork-operations"),
+        ];
+        let parts = partition_sessions_by_role(&workers);
+        assert_eq!(
+            parts.leads.iter().map(|w| w.address.as_str()).collect::<Vec<_>>(),
+            vec!["t155", "t165"],
+            "같은 레포 lead 2세션이 주소 기준으로 구분된다"
+        );
+        assert_eq!(parts.verifiers.iter().map(|w| w.address.as_str()).collect::<Vec<_>>(), vec!["t182"]);
+        assert_eq!(parts.advisors.iter().map(|w| w.address.as_str()).collect::<Vec<_>>(), vec!["t902"]);
+        assert_eq!(
+            parts.sub_workers.iter().map(|w| w.address.as_str()).collect::<Vec<_>>(),
+            vec!["t900", "t901", "t903"]
+        );
+        // 전원 합산 보존 — 어느 세션도 사라지거나 중복되지 않는다
+        assert_eq!(parts.leads.len() + parts.verifiers.len() + parts.advisors.len() + parts.sub_workers.len(), workers.len());
+        // 빈 입력 — 전부 빈 분할
+        let empty = partition_sessions_by_role(&[]);
+        assert_eq!(empty, RolePartitions::default());
+    }
+
+    #[test]
+    fn lead_count_fallback_only_for_sub_workers() {
+        // 명시적 lead 없이 sub(coder) 실행 중 → 조율 1 (기존 계약 유지)
+        let mut snap = snapshot_fixture(); // coder 2
+        assert_eq!(lead_display_count(&snap), 1);
+        // 검증·자문 세션만 실행 중이면 리드 카운터는 능동으로 승격하지 않는다 —
+        // 역할 분할 아키텍처에서 verifier/advisor는 독립 세션이지 리드 조율 증거가 아니다.
+        snap.workers.clear();
+        let mut verifier = worker("addr-v", "w-v", "alpha", None);
+        verifier.slot = RoleSlot::Verifier;
+        let mut advisor = worker("addr-a", "w-a", "alpha", None);
+        advisor.slot = RoleSlot::Advisor;
+        snap.workers.push(verifier);
+        snap.workers.push(advisor);
+        assert_eq!(lead_display_count(&snap), 0);
+        // 명시적 lead가 있으면 sub 실행 여부와 무관하게 그 수
+        let mut lead = worker("addr-l", "w-l", "alpha", None);
+        lead.slot = RoleSlot::Lead;
+        snap.workers.push(lead);
+        assert_eq!(lead_display_count(&snap), 1);
+    }
+
+    #[test]
+    fn fetch_parent_map_parses_malformed_and_mock_roster() {
+        struct ParentMock(&'static str);
+        impl dgate_core::live_sync::HcExecRunner for ParentMock {
+            fn exec(&self, _file: &str, args: &[&str], _t: u64) -> Result<String, String> {
+                if args.first() == Some(&"ls") {
+                    Ok(self.0.to_string())
+                } else {
+                    Err("nope".to_string())
+                }
+            }
+        }
+        // 정상 로스터 — address→parent 만 추출(빈 parent·부재 필드는 무시)
+        let ok = ParentMock(
+            "{\"terminals\":[
+                {\"address\":\"t900\",\"parent\":\"t155\"},
+                {\"address\":\"t901\",\"parent\":\"t165\"},
+                {\"address\":\"t902\",\"parent\":\"  \"},
+                {\"address\":\"t903\"},
+                {\"parent\":\"t999\"}
+            ]}",
+        );
+        let map = fetch_parent_map_with("hc", &ok);
+        assert_eq!(
+            map,
+            HashMap::from([
+                ("t900".to_string(), "t155".to_string()),
+                ("t901".to_string(), "t165".to_string()),
+            ])
+        );
+        // 형식 불일치·빈 응답·실행 실패 — 전부 빈 맵 폴백(패닉 없음)
+        for bad in ["", "not json", "{\"rows\":[]}", "[]"] {
+            assert!(fetch_parent_map_with("hc", &ParentMock(bad)).is_empty(), "입력: {:?}", bad);
+        }
+        struct Failing;
+        impl dgate_core::live_sync::HcExecRunner for Failing {
+            fn exec(&self, _f: &str, _a: &[&str], _t: u64) -> Result<String, String> {
+                Err("hc 없음".to_string())
+            }
+        }
+        assert!(fetch_parent_map_with("hc", &Failing).is_empty());
+    }
+
     #[test]
     fn log_panel_size_cycle_and_set() {
         // 기본 Compact(3줄) — 순환 접기→작게→크게→접기
         let mut c = DashboardController::new(false);
         assert_eq!(c.log_panel_size, LogPanelSize::Compact);
-        assert_eq!(c.log_panel_size.visible_lines(), 3);
+        assert_eq!(c.panel_sizes.visible_log_rows(), 3);
         c.cycle_log_panel_size();
         assert_eq!(c.log_panel_size, LogPanelSize::Expanded);
         c.cycle_log_panel_size();
         assert_eq!(c.log_panel_size, LogPanelSize::Collapsed);
-        assert_eq!(c.log_panel_size.visible_lines(), 0);
+        assert_eq!(c.panel_sizes.visible_log_rows(), 0);
         c.cycle_log_panel_size();
         assert_eq!(c.log_panel_size, LogPanelSize::Compact);
         // 직접 지정
         c.set_log_panel_size(LogPanelSize::Expanded);
         assert_eq!(c.log_panel_size, LogPanelSize::Expanded);
-        assert_eq!(c.log_panel_size.visible_lines(), 8);
+        assert_eq!(c.panel_sizes.visible_log_rows(), 9);
         assert_eq!(LogPanelSize::Collapsed.label(), "접기");
         assert_eq!(LogPanelSize::Compact.label(), "작게");
         assert_eq!(LogPanelSize::Expanded.label(), "크게");
+    }
+
+    // ---------- 패널 드래그 리사이즈 (PanelSizes · Zed 스타일 스플리터) ----------
+
+    #[test]
+    fn panel_sizes_defaults_and_value_of() {
+        let p = PanelSizes::default();
+        assert_eq!(p.advisor_width, DEFAULT_ADVISOR_WIDTH);
+        assert_eq!(p.verifier_width, DEFAULT_VERIFIER_WIDTH);
+        assert_eq!(p.log_height, DEFAULT_LOG_HEIGHT);
+        assert_eq!(p.value_of(DragTarget::AdvisorWidth), DEFAULT_ADVISOR_WIDTH);
+        assert_eq!(p.value_of(DragTarget::VerifierWidth), DEFAULT_VERIFIER_WIDTH);
+        assert_eq!(p.value_of(DragTarget::LogHeight), DEFAULT_LOG_HEIGHT);
+        // Default 트레잇이 명시 값과 일치(파생 Default의 0.0이 아니어야 한다)
+        assert_ne!(PanelSizes::default(), PanelSizes { advisor_width: 0.0, ..PanelSizes::default() });
+    }
+
+    #[test]
+    fn panel_drag_sign_conventions() {
+        let mut p = PanelSizes::default();
+        // AdvisorWidth — +델타(오른쪽 드래그) widen
+        p.apply_drag(DragTarget::AdvisorWidth, DEFAULT_ADVISOR_WIDTH, 52.0);
+        assert!((p.advisor_width - 300.0).abs() < 1e-6, "오른쪽 드래그는 Advisor를 넓힌다");
+        // VerifierWidth — -델타(왼쪽 드래그) widen (우측 패널)
+        p.apply_drag(DragTarget::VerifierWidth, DEFAULT_VERIFIER_WIDTH, -40.0);
+        assert!((p.verifier_width - 280.0).abs() < 1e-6, "왼쪽 드래그는 Verifier를 넓힌다");
+        // LogHeight — -델타(위로 드래그) heighten (하단 패널)
+        p.apply_drag(DragTarget::LogHeight, DEFAULT_LOG_HEIGHT, -60.0);
+        assert!((p.log_height - 164.0).abs() < 1e-6, "위로 드래그는 세션 기록을 높인다");
+        // 반대 방향은 축소
+        let mut q = PanelSizes::default();
+        q.apply_drag(DragTarget::AdvisorWidth, DEFAULT_ADVISOR_WIDTH, -48.0);
+        assert!((q.advisor_width - 200.0).abs() < 1e-6);
+        q.apply_drag(DragTarget::VerifierWidth, DEFAULT_VERIFIER_WIDTH, 30.0);
+        assert!((q.verifier_width - 210.0).abs() < 1e-6);
+        q.apply_drag(DragTarget::LogHeight, DEFAULT_LOG_HEIGHT, 20.0);
+        assert!((q.log_height - 84.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn panel_drag_clamps_min_max() {
+        let mut p = PanelSizes::default();
+        // 상한 클램프 — 훨씬 큰 델타도 MAX에 멈춘다
+        p.apply_drag(DragTarget::AdvisorWidth, DEFAULT_ADVISOR_WIDTH, 10_000.0);
+        assert_eq!(p.advisor_width, MAX_ADVISOR_WIDTH);
+        p.apply_drag(DragTarget::VerifierWidth, DEFAULT_VERIFIER_WIDTH, -10_000.0);
+        assert_eq!(p.verifier_width, MAX_VERIFIER_WIDTH);
+        p.apply_drag(DragTarget::LogHeight, DEFAULT_LOG_HEIGHT, -10_000.0);
+        assert_eq!(p.log_height, MAX_LOG_HEIGHT);
+        // 하한 클램프
+        let mut q = PanelSizes::default();
+        q.apply_drag(DragTarget::AdvisorWidth, DEFAULT_ADVISOR_WIDTH, -10_000.0);
+        assert_eq!(q.advisor_width, MIN_ADVISOR_WIDTH);
+        q.apply_drag(DragTarget::VerifierWidth, DEFAULT_VERIFIER_WIDTH, 10_000.0);
+        assert_eq!(q.verifier_width, MIN_VERIFIER_WIDTH);
+        q.apply_drag(DragTarget::LogHeight, DEFAULT_LOG_HEIGHT, 10_000.0);
+        assert_eq!(q.log_height, MIN_LOG_HEIGHT);
+        // 경계 밖 start_val로 시작해도 클램프가 값을 되돌린다(불변식 회복)
+        let mut r = PanelSizes { log_height: MAX_LOG_HEIGHT, ..PanelSizes::default() };
+        r.apply_drag(DragTarget::LogHeight, MAX_LOG_HEIGHT, 0.0);
+        assert_eq!(r.log_height, MAX_LOG_HEIGHT);
+    }
+
+    #[test]
+    fn panel_reset_restores_only_target_axis() {
+        let mut p = PanelSizes::default();
+        p.apply_drag(DragTarget::AdvisorWidth, DEFAULT_ADVISOR_WIDTH, 100.0);
+        p.apply_drag(DragTarget::VerifierWidth, DEFAULT_VERIFIER_WIDTH, -100.0);
+        p.apply_drag(DragTarget::LogHeight, DEFAULT_LOG_HEIGHT, -100.0);
+        assert_ne!(p.advisor_width, DEFAULT_ADVISOR_WIDTH);
+        assert_ne!(p.verifier_width, DEFAULT_VERIFIER_WIDTH);
+        assert_ne!(p.log_height, DEFAULT_LOG_HEIGHT);
+        // 더블클릭 리셋 — 해당 축만 기본값으로
+        p.reset(DragTarget::AdvisorWidth);
+        assert_eq!(p.advisor_width, DEFAULT_ADVISOR_WIDTH);
+        assert_ne!(p.verifier_width, DEFAULT_VERIFIER_WIDTH);
+        assert_ne!(p.log_height, DEFAULT_LOG_HEIGHT);
+        p.reset(DragTarget::VerifierWidth);
+        assert_eq!(p.verifier_width, DEFAULT_VERIFIER_WIDTH);
+        p.reset(DragTarget::LogHeight);
+        assert_eq!(p, PanelSizes::default());
+    }
+
+    #[test]
+    fn visible_log_rows_matches_height_budget() {
+        let mut p = PanelSizes::default();
+        // 기본 104px → (104-34)/20 = 3.5 → 3줄 (Compact 프리셋과 동일)
+        assert_eq!(p.visible_log_rows(), 3);
+        // 접힘 경계 — ≤46px → 0줄
+        p.log_height = 46.0;
+        assert_eq!(p.visible_log_rows(), 0);
+        p.log_height = 47.0;
+        assert_eq!(p.visible_log_rows(), 1, "46px 초과 즉시 최소 1줄");
+        // '크게' 프리셋 224px → 9줄
+        p.log_height = EXPANDED_LOG_HEIGHT;
+        assert_eq!(p.visible_log_rows(), 9);
+        // 최대 380px → 17.3 → 클램프 상한 14줄
+        p.log_height = MAX_LOG_HEIGHT;
+        assert_eq!(p.visible_log_rows(), 14);
+        p.log_height = 500.0;
+        assert_eq!(p.visible_log_rows(), 14, "어떤 높이에서도 최대 14줄");
+    }
+
+    #[test]
+    fn controller_drag_and_preset_stay_in_sync() {
+        let mut c = DashboardController::new(false);
+        // 기본 — Compact 프리셋 ↔ 기본 높이
+        assert_eq!(c.log_panel_size, LogPanelSize::Compact);
+        assert_eq!(c.panel_sizes.log_height, DEFAULT_LOG_HEIGHT);
+
+        // 프리셋 버튼 → 높이 동기화
+        c.set_log_panel_size(LogPanelSize::Collapsed);
+        assert_eq!(c.panel_sizes.log_height, MIN_LOG_HEIGHT);
+        c.set_log_panel_size(LogPanelSize::Expanded);
+        assert_eq!(c.panel_sizes.log_height, EXPANDED_LOG_HEIGHT);
+        // 순환도 높이 동기화 유지
+        c.cycle_log_panel_size(); // Expanded → Collapsed
+        assert_eq!(c.log_panel_size, LogPanelSize::Collapsed);
+        assert_eq!(c.panel_sizes.log_height, MIN_LOG_HEIGHT);
+
+        // 드래그 → 프리셋 표지 동기화 (≤46 접힘 · ≤150 작게 · >150 크게)
+        c.apply_panel_drag(DragTarget::LogHeight, DEFAULT_LOG_HEIGHT, -100.0); // 204px
+        assert_eq!(c.log_panel_size, LogPanelSize::Expanded);
+        c.apply_panel_drag(DragTarget::LogHeight, c.panel_sizes.log_height, 60.0); // 144px
+        assert_eq!(c.log_panel_size, LogPanelSize::Compact);
+        c.apply_panel_drag(DragTarget::LogHeight, c.panel_sizes.log_height, 120.0); // 34px(하한)
+        assert_eq!(c.log_panel_size, LogPanelSize::Collapsed);
+        assert_eq!(c.panel_sizes.log_height, MIN_LOG_HEIGHT);
+
+        // 폭 드래그 — 표지는 그대로, 값만 클램프 적용
+        c.apply_panel_drag(DragTarget::AdvisorWidth, DEFAULT_ADVISOR_WIDTH, 500.0);
+        assert_eq!(c.panel_sizes.advisor_width, MAX_ADVISOR_WIDTH);
+        c.apply_panel_drag(DragTarget::VerifierWidth, DEFAULT_VERIFIER_WIDTH, 500.0);
+        assert_eq!(c.panel_sizes.verifier_width, MIN_VERIFIER_WIDTH);
+
+        // 더블클릭 리셋 — 세션 기록은 Compact로 복귀, 폭은 기본값
+        c.reset_panel(DragTarget::LogHeight);
+        assert_eq!(c.log_panel_size, LogPanelSize::Compact);
+        assert_eq!(c.panel_sizes.log_height, DEFAULT_LOG_HEIGHT);
+        c.reset_panel(DragTarget::AdvisorWidth);
+        assert_eq!(c.panel_sizes.advisor_width, DEFAULT_ADVISOR_WIDTH);
+        c.reset_panel(DragTarget::VerifierWidth);
+        assert_eq!(c.panel_sizes.verifier_width, DEFAULT_VERIFIER_WIDTH);
+
+        // 스냅숏 적용은 패널 치수를 건드리지 않는다(폴링마다 드래그 값 유지 — 무점프)
+        c.apply_panel_drag(DragTarget::AdvisorWidth, DEFAULT_ADVISOR_WIDTH, 40.0);
+        let before = c.panel_sizes;
+        c.apply_snapshot(snapshot_fixture());
+        assert_eq!(c.panel_sizes, before);
     }
 }

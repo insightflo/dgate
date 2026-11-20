@@ -56,6 +56,10 @@ interface CliOptions {
   watchDb: string | null;
   /** `--repo <dir>`(별칭 `--project`) — 관측 스코프를 특정 레포로 한정 */
   repoDir: string | null;
+  /** `--all` / `-a` — 전체 세션·레포 전역 관측 */
+  all: boolean;
+  /** `--session <id>` — 관측 스코프를 특정 hc 세션(주소)으로 한정 */
+  sessionId: string | null;
   follow: boolean;
   replayMs: number;
   initialTime: number;
@@ -85,6 +89,8 @@ function parseArgs(argv: string[]): CliOptions {
     watchDir: null,
     watchDb: null,
     repoDir: null,
+    all: false,
+    sessionId: null,
     follow: false,
     replayMs: 0,
     initialTime: 0,
@@ -138,6 +144,15 @@ function parseArgs(argv: string[]): CliOptions {
         // 관측 스코프를 특정 레포로 한정 — 헤더 repo=<이름> 표기, 해당 레포 워커·통계만 표시
         const p = argv[++i];
         if (p && !p.startsWith('-')) opts.repoDir = p;
+        break;
+      }
+      case '--all':
+      case '-a':
+        opts.all = true;
+        break;
+      case '--session': {
+        const s = argv[++i];
+        if (s && !s.startsWith('-')) opts.sessionId = s;
         break;
       }
       case '--stream':
@@ -256,6 +271,8 @@ DGATE TUI (Lead · Decision Gate · Workers · Verifier · Advisor)
                                   > ~/.local/state/dgate/decision.db
   --repo, --project <dir> 관측 스코프를 특정 프로젝트(레포)로 한정 — 헤더에 repo=<이름> 표기,
                          해당 레포의 활성 hc 워커·결정 통계만 표시 (기본: 전체 레포 관측)
+  --session <id>         관측 스코프를 특정 hc 세션(주소)과 그 자식 워커로 한정
+  --all, -a              관측 스코프를 전체 세션·레포(전역)로 확장 — 기본(현 세션/현 레포)의 반대
   --live, --agy          실제 Antigravity(agy) / Gemini API 백엔드 에이전트 루프 연결 실행
   --demo                 gemini_sub_neon.html의 40초 멀티 에이전트 시나리오 데모 실행 (기본값)
   --stream               표준 입력(stdin)으로부터 JSONL(또는 agy stream-json) 실시간 렌더링
@@ -386,6 +403,70 @@ export function applyLiveRolePanels(
   }
 }
 
+/** resolveTuiScope 입력 — parseArgs 결과 중 스코프 판정에 쓰는 필드만. */
+export interface TuiScopeOptions {
+  all?: boolean;
+  sessionId?: string | null;
+  repoDir?: string | null;
+}
+
+/** resolveTuiScope 결과 — 관측 스코프 종류·레포 필터·세션 필터·헤더 라벨. */
+export interface TuiScope {
+  kind: 'all' | 'session' | 'repo';
+  repoFilterDir: string | null;
+  sessionId: string | null;
+  scopeLabel: string | null;
+}
+
+/**
+ * TUI 기본 관측 스코프 판정(순수 함수):
+ * ① `--all`이면 전역 ② `--session <id>`면 해당 세션(+`--repo` 병행 가능)
+ * ③ `--repo <dir>`면 해당 레포 ④ HC_TERMINAL_ID 환경변수가 있으면 현재 hc 세션
+ * (라벨은 `레포명·세션ID`) ⑤ 마지막 폴백은 현재 cwd 레포.
+ */
+export function resolveTuiScope(
+  opts: TuiScopeOptions,
+  env: NodeJS.ProcessEnv,
+  cwd: string
+): TuiScope {
+  if (opts.all) {
+    return { kind: 'all', repoFilterDir: null, sessionId: null, scopeLabel: null };
+  }
+  if (opts.sessionId) {
+    return {
+      kind: 'session',
+      repoFilterDir: opts.repoDir ? path.resolve(opts.repoDir) : null,
+      sessionId: opts.sessionId,
+      scopeLabel: 'session=' + opts.sessionId,
+    };
+  }
+  if (opts.repoDir) {
+    const dir = path.resolve(opts.repoDir);
+    return {
+      kind: 'repo',
+      repoFilterDir: dir,
+      sessionId: null,
+      scopeLabel: path.basename(dir) || dir,
+    };
+  }
+  const envSession = env.HC_TERMINAL_ID?.trim();
+  if (envSession) {
+    return {
+      kind: 'session',
+      repoFilterDir: null,
+      sessionId: envSession,
+      scopeLabel: path.basename(path.resolve(cwd)) + '·' + envSession,
+    };
+  }
+  const dir = path.resolve(cwd);
+  return {
+    kind: 'repo',
+    repoFilterDir: dir,
+    sessionId: null,
+    scopeLabel: path.basename(dir) || dir,
+  };
+}
+
 function main(): void {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.showHelp) {
@@ -397,10 +478,12 @@ function main(): void {
   state.paused = opts.paused;
   state.modal = opts.modalOverride;
 
-  // `--repo <dir>`: 관측 스코프를 특정 레포로 한정 — 헤더 표기·텔레메트리 projectId·live 워커 필터에 사용
-  const repoFilterDir = opts.repoDir ? path.resolve(opts.repoDir) : null;
-  if (repoFilterDir) {
-    state.repoScopeLabel = path.basename(repoFilterDir) || repoFilterDir;
+  // 관측 스코프 결정 — --all > --session > --repo > HC_TERMINAL_ID(현 세션) > cwd(현 레포).
+  // 기본값이 과거의 전역 관측에서 “현재 세션(또는 현 레포)”로 바뀌었다(전역은 --all).
+  const tuiScope = resolveTuiScope(opts, process.env, process.cwd());
+  const repoFilterDir = tuiScope.repoFilterDir;
+  if (tuiScope.scopeLabel) {
+    state.repoScopeLabel = tuiScope.scopeLabel;
   }
 
   // 활성 roster.json 역할·모델 바인딩 반영 — 실패 시 createInitialState의
@@ -843,6 +926,7 @@ function main(): void {
       liveSyncer = createLiveRosterSyncer({
         repoDir: repoFilterDir ?? opts.watchDir ?? process.cwd(),
         repoFilterDir,
+        sessionId: tuiScope.sessionId ?? undefined,
         getWatchedLead: () => watchedLeadLabel,
         onUpdate: (merged) => applyLiveRosterUpdate(merged),
       });
