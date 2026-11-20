@@ -26,9 +26,12 @@ import {
   extractLastActivityLine,
   extractRepoTag,
   inferLiveWorkerSlot,
+  isActiveTopLevelSession,
+  isObservableTerminal,
   isWorkerTerminal,
   matchesRepoScope,
   mergeLiveRosterLabels,
+  normalizeTopLevelWorker,
   type HcTerminalDetail,
   type LiveWorkerInfo,
   type MergedLiveRoster,
@@ -41,7 +44,7 @@ import {
 import { createInitialState } from '../src/state/store.ts';
 import { renderFrame } from '../src/ui/renderApp.ts';
 import { computeLayout, type FullLayout } from '../src/ui/layout.ts';
-import { applyLiveRolePanels, createLiveRoleTrail } from '../src/cli.ts';
+import { applyLiveRolePanels, createLiveRoleTrail, formatElapsedMmss } from '../src/cli.ts';
 import type { RosterDisplayLabels } from '../src/types.ts';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..');
@@ -1114,6 +1117,48 @@ test('16. 라이브 역할 패널 동기화 — verifier/advisor/lead 활성화�
   assert.ok(!/[⠋⠙⠹⠸⠼⠴⠦⠧]/.test(calm1), '침착 상태에 스피너 없음');
 });
 
+test('18. per-worker 실측 경과 MM:SS — formatElapsedMmss 경계 + 라이브 카드 렌더', () => {
+  // (a) 순수 포매터 — 0/84/3661초 및 음수·NaN 클램프
+  assert.equal(formatElapsedMmss(0), '00:00');
+  assert.equal(formatElapsedMmss(84), '01:24');
+  assert.equal(formatElapsedMmss(3661), '01:01:01');
+  assert.equal(formatElapsedMmss(-5), '00:00');
+  assert.equal(formatElapsedMmss(Number.NaN), '00:00');
+
+  // (b) 실행 중 라이브 카드 — elapsedSec 84초면 프레임에 01:24, 미지정이면 RUN 폴백
+  const state = createInitialState('watch');
+  state.phase = '워커 실행 중';
+  state.swarmActive = 2;
+  state.liveWorkers = [
+    { name: 'wA', model: 'pi:glm-5.3', progress: 0, description: '활동 A', status: 'running', elapsedSec: 84 },
+    { name: 'wB', model: 'pi:glm-5.3', progress: 0, description: '활동 B', status: 'running' },
+  ];
+  const text = renderFrame({ ...state, simTime: 1.2 }, 148, 43).toPlainString();
+  assert.ok(text.includes('01:24'), 'elapsedSec=84 → 01:24 노출');
+  assert.ok(/⠙? 01:24/.test(text), '스피너+MM:SS 조합 노출');
+
+  const noElapsed = renderFrame({ ...state, liveWorkers: state.liveWorkers.map((c) => ({ ...c, elapsedSec: undefined })) }, 148, 43).toPlainString();
+  assert.ok(noElapsed.includes(' RUN'), 'elapsedSec 미지정 → 기존 RUN 폴백 유지');
+  assert.ok(!noElapsed.includes('01:24'), '미지정 카드에는 MM:SS 미노출');
+
+  // (c) 완료 카드 — 동결 경과가 ✓ 완료 · MM:SS 로 표시
+  const doneState = createInitialState('watch');
+  doneState.swarmActive = 0;
+  doneState.liveWorkers = [
+    { name: 'wD', model: 'pi:glm-5.3', progress: 100, description: '완료됨', status: 'done', elapsedSec: 84 },
+  ];
+  const doneText = renderFrame(doneState, 148, 43).toPlainString();
+  assert.ok(doneText.includes('✓ 완료 · 01:24'), '완료 카드 동결 경과 표기');
+
+  // (d) 침착 대기 — 실행 워커 0이면 elapsed 도입 후에도 프레임 동일
+  const calm = createInitialState('watch');
+  calm.phase = '대기 중';
+  calm.liveWorkers = [];
+  const c1 = renderFrame({ ...calm, simTime: 1.0 }, 148, 43).toPlainString();
+  const c2 = renderFrame({ ...calm, simTime: 2.7 }, 148, 43).toPlainString();
+  assert.equal(c1, c2, '0 실행 워커 → 침착 프레임 불변');
+});
+
 test('17. 라이브 동기 카드 모션 게이트 — watch 폴백 cards(자리표)는 정지 유지', () => {
   // 라이브 목록 없음(liveWorkers=[]) → 폴백 cards가 running 상태여도 모션 없음
   const state = createInitialState('watch');
@@ -1129,4 +1174,120 @@ test('17. 라이브 동기 카드 모션 게이트 — watch 폴백 cards(자리
   assert.equal(f1, f2, '라이브 워커 0명 → 폴백 running 카드여도 프레임 고정');
   assert.ok(f1.includes('◉ 실행 중'), '폴백 running 카드는 정적 ◉ 실행 중 (스피너 아님)');
   assert.ok(!f1.includes(' RUN'), '라이브 부재 활성 바(RUN) 미노출');
+});
+
+// ---------------------------------------------------------------------------
+// 최상위 활성 AI 에이전트 세션 관측 확장 (w-top-level-sessions)
+
+test('18. isActiveTopLevelSession / isObservableTerminal — 최상위 working AI 세션 관측', () => {
+  // 긍정 — 워커 규약 밖 최상위 working 세션도 관측된다
+  for (const agent of ['antigravity', 'pi', 'claude', 'codex', 'devin', 'gemini', 'agy']) {
+    const t = { address: 't155', agent, name: `paperwork-${agent}`, state: 'live', status: 'working' };
+    assert.equal(isActiveTopLevelSession(t), true, agent);
+    assert.equal(isObservableTerminal(t), true, agent);
+  }
+  // kakao-manual-bot pi — 워커가 아니어도 관측
+  const pi = { address: 't1', agent: 'pi', name: 'kakao-manual-bot', state: 'live', status: 'working' };
+  assert.equal(isWorkerTerminal(pi), false);
+  assert.equal(isObservableTerminal(pi), true);
+  // 기존 워커 판정 불변 — 관측 확장이 isWorkerTerminal을 바꾸지 않는다
+  assert.equal(isObservableTerminal({ address: 'a', agent: 'pi', name: 'w-x', state: 'live' }), true);
+
+  // status 엄격 — idle/done/undefined 불가
+  for (const status of ['idle', 'done', undefined]) {
+    assert.equal(isActiveTopLevelSession({ address: 't', agent: 'antigravity', name: 's', state: 'live', status }), false);
+    assert.equal(isActiveTopLevelSession({ address: 't', agent: 'pi', name: 's', state: 'live', status }), false);
+  }
+  // state 불일치 · parent 존재
+  assert.equal(isActiveTopLevelSession({ address: 't', agent: 'pi', name: 's', state: 'done', status: 'working' }), false);
+  assert.equal(isActiveTopLevelSession({ address: 't', agent: 'pi', name: 's', state: 'live', status: 'working', parent: 'lead' }), false);
+  // 셸·런타임·모니터·GUI 제외
+  for (const agent of ['zsh', 'bash', 'sh', 'node', 'python3', 'powershell.exe', 'dgate-gui']) {
+    assert.equal(isActiveTopLevelSession({ address: 't', agent, name: 's', state: 'live', status: 'working' }), false, agent);
+  }
+  for (const name of ['dg-monitor', 'dg-monitor-x', 'mon-x', 'dgate-gui-main']) {
+    assert.equal(isActiveTopLevelSession({ address: 't', agent: 'antigravity', name, state: 'live', status: 'working' }), false, name);
+    assert.equal(isObservableTerminal({ address: 't', agent: 'antigravity', name, state: 'live', status: 'working' }), false, name);
+  }
+});
+
+test('18.5 최상위 세션 Lead 정규화 — 이름·shortModel 폴백', () => {
+  // 이름·slot·shortModel — '[paperwork-operations] lead · antigravity' 카드용
+  const w = normalizeTopLevelWorker(
+    makeWorker({ slot: 'coder', shortModel: 'custom', badge: 'custom (실행 중)', modelName: 'custom', name: 't155' }),
+    { address: 't155', agent: 'antigravity', name: 'paperwork-operations', state: 'live', status: 'working' }
+  );
+  assert.equal(w.slot, 'lead');
+  assert.equal(w.name, 'paperwork-operations');
+  assert.equal(w.shortModel, 'antigravity');
+  assert.equal(w.badge, 'antigravity (실행 중)');
+  assert.equal(w.modelName, 'antigravity');
+  // 이름 없으면 'lead'
+  const w2 = normalizeTopLevelWorker(
+    makeWorker({ name: 't156', shortModel: 'pi', modelName: 'pi' }),
+    { address: 't156', agent: 'pi', state: 'live', status: 'working' }
+  );
+  assert.equal(w2.slot, 'lead');
+  assert.equal(w2.name, 'lead');
+  assert.equal(w2.shortModel, 'pi');
+});
+
+test('18.9 syncer — 최상위 working antigravity/pi만 Lead로 관측, idle·셸·모니터·GUI 제외', async () => {
+  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lws-toplevel-')));
+  const env = isolateRosterEnv(tmp);
+  const rosterPath = path.join(tmp, 'roster.json');
+  process.env.HERDR_ROSTER_PATH = rosterPath;
+  writeTempRoster(rosterPath, 't-top', 'claude', 'claude-sonnet-4-6');
+  const repoDir = path.join(tmp, 'my-repo');
+  fs.mkdirSync(repoDir, { recursive: true });
+
+  const ls = JSON.stringify({
+    terminals: [
+      { address: 't155', agent: 'antigravity', name: 'paperwork-operations', state: 'live', status: 'working', cwd: repoDir },
+      { address: 't156', agent: 'pi', name: 'kakao-manual-bot', state: 'live', status: 'working', cwd: repoDir },
+      { address: 't157', agent: 'antigravity', name: 'idle-session', state: 'live', status: 'idle', cwd: repoDir },
+      { address: 't158', agent: 'antigravity', name: 'done-session', state: 'live', status: 'done', cwd: repoDir },
+      { address: 't159', agent: 'antigravity', name: 'no-status-session', state: 'live', cwd: repoDir },
+      { address: 't160', agent: 'zsh', name: 'shell', state: 'live', status: 'working', cwd: repoDir },
+      { address: 't161', agent: 'python3', name: 'py', state: 'live', status: 'working', cwd: repoDir },
+      { address: 't162', agent: 'node', name: 'dg-monitor', state: 'live', status: 'working', cwd: repoDir },
+      { address: 't163', agent: 'node', name: 'dgate-gui-main', state: 'live', status: 'working', cwd: repoDir },
+    ],
+  });
+  const updates: MergedLiveRoster[] = [];
+  const syncer = createLiveRosterSyncer({
+    repoDir: tmp,
+    repoFilterDir: null,
+    getWatchedLead: () => null,
+    onUpdate: (m) => updates.push(m),
+    intervalMs: 25,
+    execRunner: async (_file, args) => {
+      if (args[0] === 'ls') return ls;
+      if (args[0] === 'get') {
+        return JSON.stringify({ address: args[1]!, agent: 'antigravity', argv: ['antigravity'] });
+      }
+      return '[hc] ok';
+    },
+  });
+  try {
+    await waitFor(() => updates.length > 0);
+    const m = updates.at(-1)!;
+    assert.equal(m.workers.length, 2, 'working 최상위 antigravity+pi만 관측');
+    const byAddr = new Map(m.workers.map((w) => [w.address, w]));
+    const ant = byAddr.get('t155')!;
+    assert.equal(ant.slot, 'lead');
+    assert.equal(ant.name, 'paperwork-operations');
+    assert.equal(ant.shortModel, 'antigravity');
+    const pi = byAddr.get('t156')!;
+    assert.equal(pi.slot, 'lead');
+    assert.equal(pi.name, 'kakao-manual-bot');
+    assert.equal(pi.shortModel, 'pi');
+    for (const addr of ['t157', 't158', 't159', 't160', 't161', 't162', 't163']) {
+      assert.equal(byAddr.has(addr), false, `${addr} 미관측`);
+    }
+  } finally {
+    syncer.stop();
+    env.restore();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });

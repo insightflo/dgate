@@ -292,6 +292,18 @@ DGATE TUI (Lead · Decision Gate · Workers · Verifier · Advisor)
 }
 
 /** 라이브 역할 패널 동기화 추적 — 이 동기화가 덮어쓴 패널만 종료 시 깨끗하게 복귀시킨다. */
+/** 실측 경과(초)를 MM:SS(1시간↑ HH:MM:SS)로 — 음수·NaN은 0 클램프 */
+export function formatElapsedMmss(secs: number): string {
+  if (!Number.isFinite(secs) || secs < 0) secs = 0;
+  const total = Math.floor(secs);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const mm = String(m).padStart(2, '0');
+  const ss = String(s).padStart(2, '0');
+  return h > 0 ? `${String(h).padStart(2, '0')}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
 export interface LiveRolePanelTrail {
   phaseSet: boolean;
   /** false=미설정, 'run'=실행 중, 'pass'=완료 표시 중(소멸 시 idle 복귀 대기) */
@@ -586,10 +598,16 @@ function main(): void {
       repoTag: string;
       shortModel: string;
       slot: LiveWorkerInfo['slot'];
+      /** 주소 첫 관측 시각(ms) — 워커가 사라질 때까지 유지 */
+      startedAtMs: number;
+      /** done 전환 시 경과를 동결해 완료 카드에 그대로 노출 */
+      frozenElapsedSec: number | null;
     }
   >();
   // 역할 패널 동기화가 덮어쓴 영역 추적 — 종료 복귀 판정에 사용
   const liveRoleTrail = createLiveRoleTrail();
+  // liveWorkers 카드와 나란히 놓인 경과 계산 기준 — 폴 사이 틱에서 초 갱신용
+  const liveElapsedBasis: ({ startedAtMs: number; frozenElapsedSec: number | null } | null)[] = [];
 
   const liveRosterStateSignature = (): string =>
     JSON.stringify([
@@ -630,14 +648,30 @@ function main(): void {
     // 가변 길이 라이브 목록은 state.liveWorkers로 — state.cards는 transcriptMapper가 쓰는
     // 고정 3슬롯(tool 카테고리) 계약이므로 절대 덮어쓰지 않는다(레이아웃·렌더는 liveWorkers 우선).
     const scoped = Boolean(repoFilterDir);
-    state.liveWorkers = merged.workers.map((w) => ({
-      name: scoped ? `${w.name} · ${w.shortModel}` : `[${w.repoTag}] ${w.name} · ${w.shortModel}`,
-      model: w.shortModel,
-      progress: w.status === 'done' ? 100 : 0,
-      description: w.activity,
-      status: w.status === 'done' ? ('done' as const) : ('running' as const),
-    }));
+    const nowMs = Date.now();
+    // 주소별 경과 추적 — 첫 관측 startedAtMs 고정, done 시 경과 동결, 소멸 시 제거
+    const elapsedByAddr = new Map<string, { startedAtMs: number; frozenElapsedSec: number | null }>();
+    state.liveWorkers = merged.workers.map((w) => {
+      const prev = prevLiveWorkers.get(w.address);
+      const startedAtMs = prev?.startedAtMs ?? nowMs;
+      const done = w.status === 'done';
+      const liveElapsed = Math.max(0, Math.floor((nowMs - startedAtMs) / 1000));
+      const frozenElapsedSec = done ? (prev?.frozenElapsedSec ?? liveElapsed) : null;
+      elapsedByAddr.set(w.address, { startedAtMs, frozenElapsedSec });
+      return {
+        name: scoped ? `${w.name} · ${w.shortModel}` : `[${w.repoTag}] ${w.name} · ${w.shortModel}`,
+        model: w.shortModel,
+        progress: done ? 100 : 0,
+        description: w.activity,
+        status: done ? ('done' as const) : ('running' as const),
+        elapsedSec: frozenElapsedSec ?? liveElapsed,
+      };
+    });
     state.swarmActive = merged.activeWorkerCount;
+    liveElapsedBasis.length = state.liveWorkers.length;
+    merged.workers.forEach((w, i) => {
+      liveElapsedBasis[i] = elapsedByAddr.get(w.address) ?? null;
+    });
 
     // 역할 패널(Lead/Verifier/Advisor) 라이브 활성화 — 워커 종료 시 깨끗한 대기 복귀
     applyLiveRolePanels(state, merged, liveRoleTrail);
@@ -679,6 +713,8 @@ function main(): void {
         repoTag: w.repoTag,
         shortModel: w.shortModel,
         slot: w.slot,
+        startedAtMs: elapsedByAddr.get(w.address)?.startedAtMs ?? Date.now(),
+        frozenElapsedSec: elapsedByAddr.get(w.address)?.frozenElapsedSec ?? null,
       });
     }
     for (const [addr, prev] of [...prevLiveWorkers]) {
@@ -695,6 +731,24 @@ function main(): void {
 
     // 실제 변경 시에만 재렌더 (매 틱 방송 중복 억제)
     if (liveRosterStateSignature() !== prevSig) renderNow();
+  };
+
+  // 실행 중 라이브 워커의 경과 초 갱신 — 폴을 기다리지 않고 매 틱 MM:SS를 살아 있게
+  const refreshLiveElapsed = (): void => {
+    const cards = state.liveWorkers;
+    if (!cards || cards.length === 0) return;
+    let changed = false;
+    for (let i = 0; i < cards.length; i++) {
+      const basis = liveElapsedBasis[i];
+      const card = cards[i]!;
+      if (!basis || card.status !== 'running') continue;
+      const next = Math.max(0, Math.floor((Date.now() - basis.startedAtMs) / 1000));
+      if (card.elapsedSec !== next) {
+        card.elapsedSec = next;
+        changed = true;
+      }
+    }
+    if (changed) renderNow();
   };
 
   // 선행 버그 #1 수정: liveHooks를 Hub IPC 등록 이전에 선언해 핸들러에서 참조 가능하게 함
@@ -1073,6 +1127,7 @@ function main(): void {
     } else {
       // 라이브 스트림 모드에서도 와이어 흐름과 커서 점멸이 살아 움직이도록 시간 전진
       state.simTime += 0.08;
+      refreshLiveElapsed();
     }
     renderNow();
   }, 80);

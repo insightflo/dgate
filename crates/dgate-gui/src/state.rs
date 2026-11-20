@@ -17,12 +17,13 @@
 //! - 워커 중단은 단일 클릭으로 절대 실행되지 않는다: ① 제어 허용 토글 ② 중단 버튼
 //!   ③ 확인 버튼의 3단계 관문 + 주소가 현재 live 워커 목록에 있는 재검증.
 
+use std::collections::HashMap;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dgate_core::db::{open_db, resolve_db_path, resolve_project_identity, OpenDbOptions};
 use dgate_core::engine::RouteId;
@@ -45,6 +46,9 @@ use dgate_core::telemetry::{heuristic_prior_routes, read_telemetry_snapshot, Tel
 pub const DEFAULT_POLL_MS: u64 = 2000;
 /// UI 리프레시 감지 타이머 주기(ms) — 폴러와 뷰를 잇는 가벼운 버전 폴링.
 pub const UI_REFRESH_TICK_MS: u64 = 250;
+/// 활동 중 UI 프레임 주기(ms) — 실제 작업이 있을 때만 ~60fps 연속 모션으로
+/// 올라간다(유휴 폴링은 여전히 250ms의 조용한 버전 관찰에 머문다 — 제로-첸 유휴).
+pub const ACTIVE_ANIM_FRAME_MS: u64 = 16;
 
 // ---------------------------------------------------------------------------
 // CLI 옵션
@@ -413,11 +417,65 @@ pub fn visible_worker_columns(worker_count: usize) -> usize {
 
 /// 지금 실제로 활동 중인가 — DEMO 모드이거나 done 아닌 live 워커가 하나라도
 /// 있을 때만 true. 라이브 & 실행 0(빈 로스터·전부 완료)은 반드시 false여서
-/// GUI 애니메이션 틱(anim_tick 증가·cx.notify)이 완전히 멈추는 침착 유휴를
+/// GUI 연속 모션(anim_secs 갱신·cx.notify)이 완전히 멈추는 침착 유휴를
 /// 보장한다. 역할 카드(Lead/Verifier/Advisor)의 running은 어차피 live 워커
 /// 존재에서 유도되므로 워커 상태 기준 이 판정 하나로 충분하다.
 pub fn has_active_work(snap: &DashboardSnapshot, demo_mode: bool) -> bool {
     demo_mode || snap.workers.iter().any(|w| w.status.as_deref() != Some("done"))
+}
+
+/// 초 단위 경과 → "MM:SS" 0채움(3600초 이상은 "HH:MM:SS") — 워커 경과 타이머 표기.
+pub fn format_elapsed_mmss(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{:02}:{:02}:{:02}", h, m, s)
+    } else {
+        format!("{:02}:{:02}", m, s)
+    }
+}
+
+/// 연속 위상 — (경과 초 × 속도Hz + 오프셋)을 [0,1)로 매끄럽게 순환한다.
+/// `rem_euclid`라 음수 경과·1 초과 오프셋도 항상 안전하다(60fps 모션의 기본 소재).
+pub fn continuous_phase(elapsed_secs: f32, speed_hz: f32, offset: f32) -> f32 {
+    (elapsed_secs * speed_hz + offset).rem_euclid(1.0)
+}
+
+/// 사인 호흡 불투명도 — 위상 한 주기를 사인파로 [min_op, max_op] 안에서
+/// 매끄럽게 오간다(불연속 점프 없음). 부동소수 경계 밖 새는 값을 clamp로 막는다.
+pub fn smooth_pulse_opacity(
+    elapsed_secs: f32,
+    speed_hz: f32,
+    offset: f32,
+    min_op: f32,
+    max_op: f32,
+) -> f32 {
+    let phase = continuous_phase(elapsed_secs, speed_hz, offset);
+    let breath = (phase * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+    let value = min_op + (max_op - min_op) * breath;
+    let (lo, hi) = if min_op <= max_op { (min_op, max_op) } else { (max_op, min_op) };
+    value.clamp(lo, hi)
+}
+
+/// 헤더 LEAD [n] 카운터 표시값 — Lead 카드 상태 표기와 항상 일치시키는 판정.
+/// - lead 슬롯 실행(done 아님) 세션이 있으면 그 수(명시적 Lead 워커).
+/// - 없지만 다른 실행 워커가 있으면 1 — Lead가 부모 오케스트레이터로서
+///   '워커 조율 중' 상태이므로 카운터도 능동 1로 맞춘다.
+/// - 실행 워커가 전혀 없으면 0 — Lead 카드 '대기 중'과 동일.
+pub fn lead_display_count(snap: &DashboardSnapshot) -> usize {
+    let explicit = snap
+        .workers
+        .iter()
+        .filter(|w| w.slot.as_str() == "lead" && w.status.as_deref() != Some("done"))
+        .count();
+    if explicit > 0 {
+        explicit
+    } else if snap.workers.iter().any(|w| w.status.as_deref() != Some("done")) {
+        1
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +542,43 @@ pub fn kill_worker_safe(
 // 대시보드 컨트롤러 (UI 상태 기계 — 순수 Rust)
 // ---------------------------------------------------------------------------
 
+/// 세션 기록 패널 크기 — 접기(헤더만) / 작게(3줄 기본) / 크게(8줄 내부 스크롤).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogPanelSize {
+    Collapsed,
+    Compact,
+    Expanded,
+}
+
+impl LogPanelSize {
+    /// 이 크기에서 보여줄 로그 줄 수(접힘 = 0).
+    pub fn visible_lines(self) -> usize {
+        match self {
+            LogPanelSize::Collapsed => 0,
+            LogPanelSize::Compact => 3,
+            LogPanelSize::Expanded => 8,
+        }
+    }
+
+    /// 순환 헬퍼 — 접기 → 작게 → 크게 → 접기.
+    pub fn next(self) -> Self {
+        match self {
+            LogPanelSize::Collapsed => LogPanelSize::Compact,
+            LogPanelSize::Compact => LogPanelSize::Expanded,
+            LogPanelSize::Expanded => LogPanelSize::Collapsed,
+        }
+    }
+
+    /// 패널 토글 버튼 라벨 — 접기 / 작게 / 크게.
+    pub fn label(self) -> &'static str {
+        match self {
+            LogPanelSize::Collapsed => "접기",
+            LogPanelSize::Compact => "작게",
+            LogPanelSize::Expanded => "크게",
+        }
+    }
+}
+
 /// GPUI 뷰가 들고 다니는 UI 상태 — 스냅숏 적용·탭 선택·확인 상태 전이만 담당.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DashboardController {
@@ -499,6 +594,13 @@ pub struct DashboardController {
     pub confirm_kill_address: Option<String>,
     /// 사용자에게 보여줄 최근 조작 결과 1줄.
     pub last_action_message: Option<String>,
+    /// 워커 주소별 최초 관측 시각 — 경과 타이머(mm:ss)의 기준점. 폴링 사이 살아
+    /// 있는 워커는 기준점을 유지하고 로스터에서 사라진 주소는 자동 정리된다.
+    pub worker_started_at: HashMap<String, Instant>,
+    /// done 전환 순간 동결한 경과 초 — 완료 카드의 타이머가 계속 흐르지 않게 한다.
+    worker_done_elapsed: HashMap<String, u64>,
+    /// 세션 기록 패널 크기 — 기본 Compact(3줄).
+    pub log_panel_size: LogPanelSize,
 }
 
 impl DashboardController {
@@ -512,10 +614,15 @@ impl DashboardController {
             demo_mode: false,
             confirm_kill_address: None,
             last_action_message: None,
+            worker_started_at: HashMap::new(),
+            worker_done_elapsed: HashMap::new(),
+            log_panel_size: LogPanelSize::Compact,
         }
     }
 
     /// 폴러가 만든 새 스냅숏 반영 — 사라진 레포 탭 선택·확인 대상은 자동 해제.
+    /// 워커 최초 관측 시각도 여기서 갱신한다: 새로 등장한 주소만 찍고(기존
+    /// 기준점 유지), done 전환 시 경과를 동결하며, 로스터에 없는 주소는 정리한다.
     pub fn apply_snapshot(&mut self, snap: DashboardSnapshot) {
         if let Some(sel) = &self.selected_repo {
             if !snap.detected_repos.iter().any(|r| r == sel) {
@@ -529,6 +636,21 @@ impl DashboardController {
                     Some("확인 중이던 워커가 목록에서 사라져 확인 상태를 해제했습니다".to_string());
             }
         }
+        for w in &snap.workers {
+            self.worker_started_at.entry(w.address.clone()).or_insert_with(Instant::now);
+            if w.status.as_deref() == Some("done")
+                && !self.worker_done_elapsed.contains_key(&w.address)
+            {
+                if let Some(&started) = self.worker_started_at.get(&w.address) {
+                    self.worker_done_elapsed
+                        .insert(w.address.clone(), started.elapsed().as_secs());
+                }
+            }
+        }
+        let live: std::collections::HashSet<&str> =
+            snap.workers.iter().map(|w| w.address.as_str()).collect();
+        self.worker_started_at.retain(|addr, _| live.contains(addr.as_str()));
+        self.worker_done_elapsed.retain(|addr, _| live.contains(addr.as_str()));
         self.snapshot = Some(snap);
     }
 
@@ -645,6 +767,32 @@ impl DashboardController {
             Ok(out) => format!("hc kill {} 완료 — {}", address, out),
             Err(err) => format!("hc kill {} 실패 — {}", address, err),
         });
+    }
+
+    /// 워커 경과 초 — DEMO는 결정론적 표본값([42, 78, 29, 105] 순환), LIVE는
+    /// 최초 관측 시각 기준 실측. done 동결값이 있으면 그 값을 반환해 완료
+    /// 카드의 타이머가 흐르지 않게 한다. 모르는 주소는 None(가짜 타이머 금지).
+    pub fn worker_elapsed_secs(&self, address: &str, demo_idx: Option<usize>) -> Option<u64> {
+        if self.demo_mode {
+            const DEMO_ELAPSED: [u64; 4] = [42, 78, 29, 105];
+            return Some(DEMO_ELAPSED[demo_idx.unwrap_or(0) % DEMO_ELAPSED.len()]);
+        }
+        if let Some(&frozen) = self.worker_done_elapsed.get(address) {
+            return Some(frozen);
+        }
+        self.worker_started_at
+            .get(address)
+            .map(|t| t.elapsed().as_secs())
+    }
+
+    /// 세션 기록 패널 크기 순환 — 접기 → 작게 → 크게 → 접기.
+    pub fn cycle_log_panel_size(&mut self) {
+        self.log_panel_size = self.log_panel_size.next();
+    }
+
+    /// 세션 기록 패널 크기 직접 지정(접기/작게/크게 버튼).
+    pub fn set_log_panel_size(&mut self, size: LogPanelSize) {
+        self.log_panel_size = size;
     }
 }
 
@@ -2031,5 +2179,151 @@ mod tests {
         handle.set_paused(true);
         join.shutdown();
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---------- 60fps 연속 모션 헬퍼 · 워커 경과 타이머 · LEAD 카운터 · 로그 패널 ----------
+
+    #[test]
+    fn format_elapsed_mmss_shapes() {
+        assert_eq!(format_elapsed_mmss(0), "00:00");
+        assert_eq!(format_elapsed_mmss(5), "00:05");
+        assert_eq!(format_elapsed_mmss(84), "01:24");
+        assert_eq!(format_elapsed_mmss(59 * 60 + 3), "59:03");
+        // 3600초 이상은 HH:MM:SS로 확장(브리프 계약 — 3661s → 01:01:01)
+        assert_eq!(format_elapsed_mmss(3600), "01:00:00");
+        assert_eq!(format_elapsed_mmss(3661), "01:01:01");
+        assert_eq!(format_elapsed_mmss(3903), "01:05:03");
+    }
+
+    #[test]
+    fn continuous_phase_stays_in_unit_range() {
+        for t in [0.0f32, 0.13, 1.7, 9.99, 1234.5, -0.3] {
+            let p = continuous_phase(t, 0.75, 0.29);
+            assert!((0.0..1.0).contains(&p), "위상 {}가 [0,1) 밖", p);
+        }
+        // 오프셋 정규화 — 1을 넘는 오프셋은 위상으로 접힌다
+        assert!((continuous_phase(0.0, 1.0, 1.3) - continuous_phase(0.0, 1.0, 0.3)).abs() < 1e-6);
+        // 시간이 흐르면 위상도 흐른다
+        assert!(continuous_phase(0.5, 1.0, 0.0) > continuous_phase(0.4, 1.0, 0.0));
+    }
+
+    #[test]
+    fn smooth_pulse_opacity_breathes_inside_bounds() {
+        for i in 0..200 {
+            let t = i as f32 * 0.013;
+            let op = smooth_pulse_opacity(t, 0.9, 0.25, 0.45, 1.0);
+            assert!((0.45..=1.0).contains(&op), "불투명도 {}가 [0.45,1.0] 밖", op);
+        }
+        // min==max — 불변 출력
+        assert_eq!(smooth_pulse_opacity(1.23, 0.9, 0.0, 0.5, 0.5), 0.5);
+        // 위상 0.25(sin=1)에서 최대, 0.75(sin=-1)에서 최소
+        assert!((smooth_pulse_opacity(0.25, 1.0, 0.0, 0.2, 0.8) - 0.8).abs() < 1e-6);
+        assert!((smooth_pulse_opacity(0.75, 1.0, 0.0, 0.2, 0.8) - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn controller_tracks_worker_first_seen_and_cleanup() {
+        let mut c = DashboardController::new(false);
+        let snap = snapshot_fixture(); // addr-a(alpha) · addr-b(beta)
+        c.apply_snapshot(snap.clone());
+        let first_seen = c.worker_started_at["addr-a"];
+        assert!(c.worker_started_at.contains_key("addr-b"));
+
+        // 폴링 반복 — 기존 워커 기준점은 유지(타이머가 폴링마다 리셋되지 않는다)
+        std::thread::sleep(Duration::from_millis(5));
+        c.apply_snapshot(snap.clone());
+        assert_eq!(c.worker_started_at["addr-a"], first_seen);
+
+        // 경과 초 — 최초 관측 이후 실제로 흐른 시간(초 단위)
+        assert!(c.worker_elapsed_secs("addr-a", None).unwrap() <= 5);
+        // 모르는 주소는 None(가짜 타이머 금지)
+        assert!(c.worker_elapsed_secs("ghost", None).is_none());
+
+        // 워커 퇴장 — 주소 정리
+        let mut shrunk = snapshot_fixture();
+        shrunk.workers.truncate(1);
+        c.apply_snapshot(shrunk);
+        assert!(c.worker_started_at.contains_key("addr-a"));
+        assert!(!c.worker_started_at.contains_key("addr-b"));
+    }
+
+    #[test]
+    fn controller_freezes_elapsed_once_worker_done() {
+        let mut c = DashboardController::new(false);
+        let mut snap = snapshot_fixture();
+        c.apply_snapshot(snap.clone());
+        // addr-a → done 전환 — 이 순간의 경과로 동결된다
+        snap.workers[0].status = Some("done".to_string());
+        std::thread::sleep(Duration::from_millis(15));
+        c.apply_snapshot(snap);
+        let frozen = c.worker_elapsed_secs("addr-a", None).unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(
+            c.worker_elapsed_secs("addr-a", None).unwrap(),
+            frozen,
+            "완료 후 타이머는 정지"
+        );
+        // 실행 중 워커는 실측 경로 유지
+        assert!(c.worker_elapsed_secs("addr-b", None).is_some());
+    }
+
+    #[test]
+    fn controller_demo_elapsed_is_deterministic() {
+        let mut c = DashboardController::new(false);
+        c.apply_snapshot(snapshot_fixture());
+        c.toggle_demo_mode();
+        assert_eq!(c.worker_elapsed_secs("demo-w-lead-1", Some(0)), Some(42));
+        assert_eq!(c.worker_elapsed_secs("demo-w-coder-1", Some(2)), Some(29));
+        // idx 순환 % 4
+        assert_eq!(c.worker_elapsed_secs("x", Some(4)), Some(42));
+        assert_eq!(c.worker_elapsed_secs("x", Some(7)), Some(105));
+        // LIVE 복귀 — 데모 주소는 live 기록에 없어 None, 실제 주소는 실측
+        c.toggle_demo_mode();
+        assert_eq!(c.worker_elapsed_secs("demo-w-lead-1", Some(0)), None);
+        assert!(c.worker_elapsed_secs("addr-a", None).is_some());
+    }
+
+    #[test]
+    fn lead_display_count_matches_lead_card_state() {
+        let mut snap = snapshot_fixture(); // coder 워커 2명 실행 중, lead 슬롯 없음
+        assert_eq!(lead_display_count(&snap), 1, "하위 워커 실행 중 → 조율 중 1");
+        // 전원 done — Lead 카드 '대기 중' → 카운터 0
+        for w in &mut snap.workers {
+            w.status = Some("done".to_string());
+        }
+        assert_eq!(lead_display_count(&snap), 0);
+        // 명시적 lead 실행 세션 — 그 수를 그대로
+        let mut lead = worker("addr-lead", "w-lead", "alpha", None);
+        lead.slot = RoleSlot::Lead;
+        let mut lead2 = worker("addr-lead2", "w-lead2", "alpha", None);
+        lead2.slot = RoleSlot::Lead;
+        snap.workers.push(lead);
+        snap.workers.push(lead2);
+        assert_eq!(lead_display_count(&snap), 2);
+        // done lead 세션은 세지 않는다
+        snap.workers[3].status = Some("done".to_string());
+        assert_eq!(lead_display_count(&snap), 1);
+    }
+
+    #[test]
+    fn log_panel_size_cycle_and_set() {
+        // 기본 Compact(3줄) — 순환 접기→작게→크게→접기
+        let mut c = DashboardController::new(false);
+        assert_eq!(c.log_panel_size, LogPanelSize::Compact);
+        assert_eq!(c.log_panel_size.visible_lines(), 3);
+        c.cycle_log_panel_size();
+        assert_eq!(c.log_panel_size, LogPanelSize::Expanded);
+        c.cycle_log_panel_size();
+        assert_eq!(c.log_panel_size, LogPanelSize::Collapsed);
+        assert_eq!(c.log_panel_size.visible_lines(), 0);
+        c.cycle_log_panel_size();
+        assert_eq!(c.log_panel_size, LogPanelSize::Compact);
+        // 직접 지정
+        c.set_log_panel_size(LogPanelSize::Expanded);
+        assert_eq!(c.log_panel_size, LogPanelSize::Expanded);
+        assert_eq!(c.log_panel_size.visible_lines(), 8);
+        assert_eq!(LogPanelSize::Collapsed.label(), "접기");
+        assert_eq!(LogPanelSize::Compact.label(), "작게");
+        assert_eq!(LogPanelSize::Expanded.label(), "크게");
     }
 }

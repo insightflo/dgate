@@ -231,6 +231,43 @@ pub fn is_worker_terminal(t: &HcTerminalSummary) -> bool {
     false
 }
 
+/// 최상위 활성 AI 에이전트 세션으로 인정하는 에이전트 집합 — 관측 대상 확장용.
+/// 셸(zsh/bash/…)·python3·dgate-gui는 절대 포함하지 않는다.
+const TOP_LEVEL_AI_AGENTS: [&str; 7] = ["antigravity", "pi", "claude", "codex", "devin", "gemini", "agy"];
+
+/// 모니터·GUI 전용 세션명 — 최상위 세션 관측에서도 제외.
+fn is_monitor_or_gui_name(name: &str) -> bool {
+    re_monitor_name().is_match(name) || name.starts_with("mon-") || name.starts_with("dgate-gui")
+}
+
+/// `hc ls` 터미널이 "관측 대상"인지 판정 — 기존 워커 규약 + 최상위 활성 AI 세션.
+/// is_worker_terminal 동작은 그대로 두고 조합만 확장한다.
+pub fn is_observable_terminal(t: &HcTerminalSummary) -> bool {
+    is_worker_terminal(t) || is_active_top_level_session(t)
+}
+
+/// 최상위(parent 없음) 활성 AI 에이전트 세션 판정 — 리드 관측 확장:
+/// ① `state === 'live'` ② `status === 'working'` (엄격 — idle/done/None 불가)
+/// ③ parent 부재·빈 값 ④ 모니터·GUI(dg-monitor*/mon-*/dgate-gui*) 제외
+/// ⑤ agent(소문자)가 AI 코딩 에이전트 7종 안팎.
+pub fn is_active_top_level_session(t: &HcTerminalSummary) -> bool {
+    if t.state.as_deref() != Some("live") {
+        return false;
+    }
+    if t.status.as_deref() != Some("working") {
+        return false;
+    }
+    if t.parent.as_deref().map(str::trim).is_some_and(|p| !p.is_empty()) {
+        return false;
+    }
+    let name = t.name.as_deref().unwrap_or("");
+    if is_monitor_or_gui_name(name) {
+        return false;
+    }
+    let agent = t.agent.as_deref().unwrap_or("").to_lowercase();
+    TOP_LEVEL_AI_AGENTS.contains(&agent.as_str())
+}
+
 // ---------------------------------------------------------------------------
 // 레포 태그·스코프
 // ---------------------------------------------------------------------------
@@ -656,6 +693,28 @@ pub fn infer_live_worker_slot(detail: &HcTerminalDetail, raw_screen: Option<&str
 // 라벨 병합
 // ---------------------------------------------------------------------------
 
+/// 최상위 활성 AI 세션을 Lead 카드로 정규화:
+/// - 슬롯은 Lead 고정(LEAD 카운터·Lead 카드에 반영).
+/// - 표시명은 비어 있지 않은 세션명, 없으면 'lead'(원 주소 노출 방지).
+/// - `--model` 미파싱 시 shortModel·modelName을 agent명(예: 'antigravity')으로 폴백.
+pub fn normalize_top_level_worker(worker: &mut LiveWorkerInfo, summary: &HcTerminalSummary) {
+    worker.slot = RoleSlot::Lead;
+    let name = summary.name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(n) = name {
+        worker.name = n.to_string();
+    } else {
+        worker.name = "lead".to_string();
+    }
+    let agent = summary.agent.as_deref().unwrap_or("").trim().to_lowercase();
+    if !agent.is_empty() && worker.short_model == "custom" {
+        worker.short_model = agent.clone();
+        worker.badge = format!("{} (실행 중)", agent);
+        if worker.model_name.is_empty() || worker.model_name == "custom" {
+            worker.model_name = agent;
+        }
+    }
+}
+
 /// 라이브 오버라이드 대상 슬롯(lead는 watchedLead 부재 시에만).
 const LIVE_OVERRIDE_SLOTS: [LiveWorkerSlot; 4] = [
     RoleSlot::Verifier,
@@ -961,7 +1020,7 @@ impl LiveSyncSnapshotter {
                 terminals
                     .into_iter()
                     .filter(|t| {
-                        is_worker_terminal(t)
+                        is_observable_terminal(t)
                             && matches_repo_scope(
                                 t.cwd.as_deref(),
                                 self.repo_filter_dir.as_deref().and_then(|p| p.to_str()),
@@ -1024,7 +1083,12 @@ impl LiveSyncSnapshotter {
                     }
                 }
                 let raw_screen = screen.or_else(|| self.screen_cache.get(&summary.address).cloned());
-                if let Some(worker) = infer_live_worker_slot(&detail, raw_screen.as_deref()) {
+                if let Some(mut worker) = infer_live_worker_slot(&detail, raw_screen.as_deref()) {
+                    // 최상위 활성 AI 세션(워커 규약 밖 리드 등) — Lead 슬롯·표시명·
+                    // shortModel 폴백을 정규화한다. 워커 규약 터미널은 그대로 둔다.
+                    if is_active_top_level_session(summary) && !is_worker_terminal(summary) {
+                        normalize_top_level_worker(&mut worker, summary);
+                    }
                     workers.push(worker);
                 }
             }
@@ -1160,6 +1224,86 @@ mod tests {
         // agy는 parent 매칭 대상 아님(이름 접두로만 통과)
         assert!(!is_worker_terminal(&summary("random-name", "agy", "live", Some("x"))));
         assert!(is_worker_terminal(&summary("w-agy", "agy", "live", None)));
+    }
+
+    // ---------- is_active_top_level_session / is_observable_terminal ----------
+
+    fn top_summary(name: &str, agent: &str, status: Option<&str>) -> HcTerminalSummary {
+        HcTerminalSummary {
+            address: format!("addr-{}", name),
+            agent: Some(agent.to_string()),
+            name: Some(name.to_string()),
+            parent: None,
+            state: Some("live".to_string()),
+            status: status.map(str::to_string),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn top_level_active_sessions_are_observable_as_lead() {
+        // 긍정 — 최상위 working AI 에이전트는 관측된다(워커 규약 밖 포함)
+        for agent in ["antigravity", "pi", "claude", "codex", "devin", "gemini", "agy"] {
+            let t = top_summary(&format!("paperwork-{}", agent), agent, Some("working"));
+            assert!(is_active_top_level_session(&t), "{}", agent);
+            assert!(is_observable_terminal(&t), "{}", agent);
+        }
+        // kakao-manual-bot pi 예시 — 워커가 아니여도 관측된다
+        let pi = top_summary("kakao-manual-bot", "pi", Some("working"));
+        assert!(!is_worker_terminal(&pi));
+        assert!(is_observable_terminal(&pi));
+        // is_worker_terminal 동작 불변 — 관측 확장이 워커 판정을 바꾸지 않는다
+        let w = summary("w-1", "pi", "live", None);
+        assert!(is_observable_terminal(&w) && is_worker_terminal(&w));
+    }
+
+    #[test]
+    fn top_level_session_strict_exclusions() {
+        // status 엄격 — idle/done/None 불가
+        for status in [Some("idle"), Some("done"), None] {
+            assert!(!is_active_top_level_session(&top_summary("s", "antigravity", status)));
+            assert!(!is_active_top_level_session(&top_summary("s", "pi", status)));
+        }
+        // state 불일치
+        let mut dead = top_summary("s", "pi", Some("working"));
+        dead.state = Some("done".into());
+        assert!(!is_active_top_level_session(&dead));
+        // parent 존재 — 최상위 아님
+        let mut child = top_summary("s", "pi", Some("working"));
+        child.parent = Some("lead-addr".into());
+        assert!(!is_active_top_level_session(&child));
+        // 셸·런타임·모니터·GUI 제외
+        for agent in ["zsh", "bash", "sh", "node", "python3", "powershell.exe", "dgate-gui"] {
+            assert!(!is_active_top_level_session(&top_summary("s", agent, Some("working"))), "{}", agent);
+        }
+        for name in ["dg-monitor", "dg-monitor-x", "mon-x", "dgate-gui-main"] {
+            let t = top_summary(name, "antigravity", Some("working"));
+            assert!(!is_active_top_level_session(&t), "{}", name);
+            assert!(!is_observable_terminal(&t), "{}", name);
+        }
+    }
+
+    #[test]
+    fn top_level_worker_normalized_to_lead_card() {
+        // 이름·slot·shortModel 폴백 — 렌더 카드 '[paperwork-operations] lead · antigravity'
+        let sum = top_summary("paperwork-operations", "antigravity", Some("working"));
+        let mut w = worker(RoleSlot::Coder, "custom", None);
+        w.name = "t155".to_string();
+        normalize_top_level_worker(&mut w, &sum);
+        assert_eq!(w.slot, RoleSlot::Lead);
+        assert_eq!(w.name, "paperwork-operations");
+        assert_eq!(w.short_model, "antigravity");
+        assert_eq!(w.badge, "antigravity (실행 중)");
+        assert_eq!(w.model_name, "antigravity");
+        // 이름 없으면 'lead'로 표시
+        let mut sum2 = top_summary("", "pi", Some("working"));
+        sum2.name = None;
+        let mut w2 = worker(RoleSlot::Coder, "pi", None);
+        w2.name = "t155".to_string();
+        normalize_top_level_worker(&mut w2, &sum2);
+        assert_eq!(w2.slot, RoleSlot::Lead);
+        assert_eq!(w2.name, "lead");
+        assert_eq!(w2.short_model, "pi");
     }
 
     // ---------- extract_repo_tag ----------
@@ -1737,6 +1881,38 @@ mod tests {
         assert_eq!(merged.labels.coder, "pi:glm-5.3");
         assert_eq!(received.lock().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn snapshotter_observes_top_level_active_session_as_lead() {
+        let _g: MutexGuard<'_, ()> = env_lock();
+        let tmp = temp_dir("live-toplevel");
+        std::fs::create_dir_all(&tmp).unwrap();
+        isolate_env(&tmp);
+        // 워커 규약 밖 최상위 working antigravity — Lead 카드로 관측된다
+        let ls = serde_json::json!({
+            "terminals": [
+                {"address": "t155", "agent": "antigravity", "name": "paperwork-operations",
+                 "state": "live", "status": "working", "cwd": "/tmp/ops", "parent": null},
+                {"address": "t156", "agent": "antigravity", "name": "idle-session",
+                 "state": "live", "status": "idle", "cwd": "/tmp/ops"},
+                {"address": "t157", "agent": "zsh", "name": "shell",
+                 "state": "live", "status": "working", "cwd": "/tmp/ops"}
+            ]
+        })
+        .to_string();
+        let details = HashMap::from([(
+            "t155".to_string(),
+            serde_json::json!({"address": "t155", "agent": "antigravity", "name": "paperwork-operations", "argv": ["antigravity"]}).to_string(),
+        )]);
+        let mock = Arc::new(MockHc::new(vec![ls], details, HashMap::new()));
+        let mut snap = snapshot_with_mock(mock, &tmp);
+        let merged = snap.tick_now();
+        assert_eq!(merged.active_worker_count, 1);
+        let w = &merged.workers[0];
+        assert_eq!(w.slot, RoleSlot::Lead);
+        assert_eq!(w.name, "paperwork-operations");
+        assert_eq!(w.short_model, "antigravity");
     }
 
     #[test]

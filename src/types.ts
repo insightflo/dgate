@@ -58,6 +58,8 @@ export interface SwarmCard {
   progress: number; // 0 ~ 100
   description: string;
   status: 'running' | 'done' | 'idle' | 'error';
+  /** 라이브 워커 실측 경과 시간(초) — 렌더에서 MM:SS로 표시. 폴백 카드에는 없음. */
+  elapsedSec?: number;
 }
 
 export interface SwarmWorker {

@@ -17,25 +17,34 @@
 //!   않게 한다. 결과는 `note_kill_result`로 1줄 회신.
 //! - 동적 N스템 커넥터 — 보이는 워커 수(1/2/3/4+)와 정확히 같은 수의 스템을 그리고
 //!   초과 워커는 2행 랩 + '+M개 추가' 배지로 절대 가리지 않는다.
-//! - 라이브 모션 — 실제 활동 중(`state::has_active_work`)일 때만 anim_tick이
-//!   진행하며 스피너·슬라이딩 알약·와이어 펄스 점이 움직인다. 라이브 유휴(실행 0)는
-//!   anim_tick 증가도 cx.notify도 없는 제로-첸 침묵 상태를 유지한다.
+//! - 라이브 모션 — 실제 활동 중(`state::has_active_work`)일 때만 16ms(~60fps)
+//!   프레임으로 벽시계 경과(anim_secs)를 갱신해 연속 부동소수 모션을 그린다.
+//!   라이브 유휴(실행 0)는 anim_secs 갱신도 cx.notify도 없는 제로-첸 침묵
+//!   상태를 유지한다(유휴 폴링은 여전히 조용한 250ms 버전 관찰).
+//! - 무 지터 레이아웃 — 모든 애니메이션 와이어·점은 고정 픽셀 높이 컨테이너 안에서
+//!   `.relative()` + `.absolute()` 오프셋으로만 움직인다(프레임마다 자식 증감·세그
+//!   먼트 높이 변화 금지). 카드의 모든 텍스트 줄은 truncate + 고정 높이로 줄바
+//!   꿈·카드 높이 변화를 원천 차단하고 스피너는 고정폭 박스에 담아 수평 흔들림도
+//!   없다.
 //! - 반응형 — viewport 폭에 따라 Advisor/Pipeline·Lead/Verifier 스택킹(960px)과
 //!   워커 그리드 열 상한(820px 기준 2열)이 바뀐다(640px까지 자유 리사이즈).
+//! - 수직 컴팩트 — 780px 창 높이에 헤더→푸터 전체가 한 화면으로 들어온다
+//!   (overflow_y_scroll은 창을 매우 줄였을 때의 안전 폴백으로만 남아 있다).
 //! - 대기 상태(워커 0)에는 가짜 진행·애니메이션을 두지 않는다 — 침착한 청사진 슬롯.
 //!   완료(done) 워커의 활동바 채움은 주소 해시의 안정 값(재렌더링에도 변하지 않는다).
 
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     div, prelude::*, px, relative, Context, FontWeight, Pixels, Render, Rgba, SharedString, Window,
 };
 
 use crate::state::{
-    has_active_work, kill_worker_safe, visible_worker_columns, DashboardController,
-    DashboardSnapshot, DefaultKillExecutor, DecisionLabel, GuiCliOptions, PollerHandle,
-    RecentLogEntry, RouteMetric, UI_REFRESH_TICK_MS,
+    continuous_phase, format_elapsed_mmss, has_active_work, kill_worker_safe,
+    lead_display_count, smooth_pulse_opacity, visible_worker_columns, DashboardController,
+    DashboardSnapshot, DefaultKillExecutor, DecisionLabel, GuiCliOptions, LogPanelSize,
+    PollerHandle, RecentLogEntry, RouteMetric, ACTIVE_ANIM_FRAME_MS, UI_REFRESH_TICK_MS,
 };
 use dgate_core::live_sync::LiveWorkerInfo;
 use dgate_core::redact::redact_secrets;
@@ -82,12 +91,14 @@ const ROSE_DANGER: Rgba = hex_rgba(0xf16e69); // trafficRed — 강제분기/중
 
 const ROSE_BG_HOVER: Rgba = hex_rgba(0x3a2230); // 중단 버튼 호버 배경
 
-/// 브라일 스피너 프레임 — 활동 중인 카드·역할 패널이 250ms anim_tick마다 회전.
+/// 브라일 스피너 프레임 — 활동 중인 카드·역할 패널이 10Hz로 회전.
 const SPINNER_FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
 
 /// 슬롯 idx만큼 위상을 옮긴 스피너 문자 — 여러 워커가 돌아도 페이즈가 흩어진다.
-fn spinner_char(anim_tick: u64, idx: usize) -> char {
-    SPINNER_FRAMES[(anim_tick.wrapping_add(idx as u64) % 8) as usize]
+/// anim_secs는 실측 벽시계 경과(초)라 10Hz 회전이 프레임 카운터와 무관하게 정확하다.
+fn spinner_char(anim_secs: f32, idx: usize) -> char {
+    let tick = (anim_secs * 10.0) as u64;
+    SPINNER_FRAMES[(tick.wrapping_add(idx as u64) % 8) as usize]
 }
 
 /// 뷰 엔티티 — GPUI 창 1개가 1개 소유.
@@ -97,8 +108,10 @@ pub struct DashboardView {
     pub db_path_label: String,
     pub poll_interval_label: String,
     pub hc_bin: String,
-    /// 라이브 모션 틱 — 활동 중일 때만 250ms마다 증가(유휴 정지·제로-첸).
-    pub anim_tick: u64,
+    /// 라이브 모션 기준 경과 초 — 활동 중일 때만 흐르는 실측 벽시계(유휴 정지·제로-첸).
+    pub anim_secs: f32,
+    /// anim_secs의 기준 시각 — 프레임마다 elapsed로 환산(누적 오차 없는 벽시계).
+    pub anim_epoch: Instant,
 }
 
 impl DashboardView {
@@ -107,13 +120,20 @@ impl DashboardView {
         // `--demo` 기동 — 첫 화면부터 내장 토폴로지 미리보기.
         controller.demo_mode = opts.demo;
         let shared = poller.shared.clone();
-        // 백그라운드 폴러 관찰 태스크 — version 변화 감지 + 활동 중 라이브 모션 틱.
-        // 유휴(!demo && 실행 워커 0)에는 anim_tick 증가·cx.notify 모두 하지 않는다.
+        // 백그라운드 폴러 관찰 태스크 — version 변화 감지 + 활동 중 60fps 연속 모션.
+        // 유휴(!demo && 실행 워커 0)에는 anim_secs 갱신·cx.notify 모두 하지 않고
+        // 프레임 주기도 조용한 250ms 버전 폴링으로 내려간다(완전 제로-첸 유휴).
         cx.spawn(async move |this, cx| {
             let mut last_version = 0u64;
+            let mut last_active = false;
             loop {
+                // 적응형 프레임 — 활동 중 16ms(~60fps), 유휴는 250ms 버전 폴링.
                 cx.background_executor()
-                    .timer(Duration::from_millis(UI_REFRESH_TICK_MS))
+                    .timer(Duration::from_millis(if last_active {
+                        ACTIVE_ANIM_FRAME_MS
+                    } else {
+                        UI_REFRESH_TICK_MS
+                    }))
                     .await;
                 if shared.shutdown.load(Ordering::SeqCst) {
                     break;
@@ -127,11 +147,12 @@ impl DashboardView {
                     .update(cx, |view, cx| {
                         if version_changed {
                             if let Some(snap) = snap {
+                                // 워커 최초 관측 시각(mm:ss 타이머 기준점)도 여기서 갱신.
                                 view.controller.apply_snapshot(snap);
                             }
                         }
                         // 활동 게이트 — DEMO 또는 실행 중(done 아님) 워커가 있을 때만
-                        // anim_tick을 진행하고 다시 그린다. 원 스냅숏에 활동이 없으면
+                        // 연속 모션으로 다시 그린다. 원 스냅숏에 활동이 없으면
                         // filtered() 복제 비용도 들이지 않는다(완전 유휴 크론 0).
                         let demo = view.controller.demo_mode;
                         let coarse = demo
@@ -140,12 +161,18 @@ impl DashboardView {
                                 .snapshot
                                 .as_ref()
                                 .is_some_and(|s| has_active_work(s, false));
-                        if coarse && has_active_work(&view.controller.filtered(), demo) {
-                            view.anim_tick = view.anim_tick.wrapping_add(1);
+                        let active = coarse && has_active_work(&view.controller.filtered(), demo);
+                        if active {
+                            // 실측 벽시계 경과 — 프레임 카운터가 아닌 연속 시간.
+                            view.anim_secs = view.anim_epoch.elapsed().as_secs_f32();
+                            last_active = true;
                             cx.notify();
-                        } else if version_changed {
+                        } else {
+                            last_active = false;
                             // 유휴 중 새 스냅숏 — 데이터 반영 1회만 다시 그린다.
-                            cx.notify();
+                            if version_changed {
+                                cx.notify();
+                            }
                         }
                     })
                     .is_ok();
@@ -165,7 +192,8 @@ impl DashboardView {
                 .unwrap_or_else(|| "~/.local/state/dgate/decision.db".to_string()),
             poll_interval_label: format!("{}ms", opts.poll_ms),
             hc_bin: "hc".to_string(),
-            anim_tick: 0,
+            anim_secs: 0.0,
+            anim_epoch: Instant::now(),
         }
     }
 
@@ -201,7 +229,9 @@ impl DashboardView {
                 el.child(pill("hc 없음", LEAD_ORANGE, BG_CHROME))
             });
 
-        // 라이브 카운터 — TUI 헤더 우측 4색 카운터의 역할별 live 세션 수
+        // 라이브 카운터 — TUI 헤더 우측 4색 카운터의 역할별 live 세션 수.
+        // LEAD는 부모 오케스트레이터라 자식 터미널 로스터에 안 나오므로
+        // lead_display_count로 Lead 카드 상태(워커 조율 중/대기 중)와 항상 일치시킨다.
         let counters = div()
             .flex()
             .flex_1()
@@ -210,7 +240,7 @@ impl DashboardView {
             .justify_center()
             .gap_3()
             .overflow_hidden()
-            .child(counter_label("LEAD", live_count(snap, "lead"), LEAD_ORANGE))
+            .child(counter_label("LEAD", lead_display_count(snap), LEAD_ORANGE))
             .child(counter_label("WORKERS", worker_count(snap), WORKER_BLUE))
             .child(counter_label("VERIFIES", live_count(snap, "verifier"), VERIFIER_NEON))
             .child(counter_label("ADVISOR", live_count(snap, "advisor"), ADVISOR_PURPLE));
@@ -348,7 +378,7 @@ impl DashboardView {
                     .items_center()
                     .gap_3()
                     .gap_y_2()
-                    .min_h_12()
+                    .min_h_10()
                     .px_4()
                     .child(left)
                     .child(counters)
@@ -423,8 +453,8 @@ impl DashboardView {
             .justify_between()
             .gap_3()
             .gap_y_2()
-            .min_h_9()
-            .py_1()
+            .min_h(px(28.))
+            .py_0()
             .px_4()
             .bg(BG)
             .child(legend)
@@ -468,7 +498,7 @@ impl DashboardView {
             .flex_1()
             .min_h_0()
             .px_4()
-            .py_3()
+            .py_2()
             .child(body)
     }
 
@@ -495,18 +525,39 @@ impl DashboardView {
                 None => "shadow 평가 없음 · 호출 — · 토큰 —".to_string(),
             }
         };
-        // 활동 중 헤더 스피너 — 대기 중에는 정지 상태 그대로.
-        let title = if active {
-            format!("{} Advisor", spinner_char(self.anim_tick, 0))
-        } else {
-            "Advisor".to_string()
-        };
+        // 활동 중 헤더 스피너 — 고정폭 박스에 담아 활성/비활성 전환에도 레이아웃가
+        // 흔들리지 않고, 대기 중에는 빈 박스로 정지 상태 그대로.
+        let title = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .min_w_0()
+            .child(
+                div()
+                    .w(px(14.))
+                    .flex_shrink_0()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(ADVISOR_PURPLE)
+                    .when(active, |el| {
+                        el.child(spinner_char(self.anim_secs, 0).to_string())
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(ADVISOR_PURPLE)
+                    .truncate()
+                    .child("Advisor"),
+            );
 
         let mut panel = div()
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
+            .gap_1()
+            .p_2()
             .rounded_lg()
             .bg(if active { BG_GLOW_PURPLE } else { BG_ELEVATED })
             .border_1()
@@ -527,29 +578,25 @@ impl DashboardView {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(ADVISOR_PURPLE)
-                            .child(title),
-                    )
+                    .min_h(px(18.))
+                    .child(title)
                     .child(div().flex_1())
                     .child(pill(state_label, state_color, BG)),
             )
             .child(
                 div()
-                    .text_size(px(11.))
+                    .h(px(14.))
+                    .text_size(px(10.))
                     .text_color(if active { ADVISOR_PURPLE } else { MUTED })
                     .truncate()
                     .child(model),
             )
-            // 자문 게이트 3종 — 활성 게이트 배지는 모션 중 농도 펄스(대기 정지)
+            // 자문 게이트 3종 — 활성 게이트 배지는 사인 호흡(대기 정지)
             .child(advisor_gate(
                 true,
                 "계획 확정 전",
                 "━━◈▶",
-                self.anim_tick,
+                self.anim_secs,
                 active,
             ))
             .child(
@@ -557,19 +604,22 @@ impl DashboardView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .p_2()
+                    .p_1()
                     .rounded_md()
                     .bg(BG)
                     .border_1()
                     .border_color(BORDER_LOG)
                     .child(
                         div()
+                            .h(px(14.))
                             .text_size(px(10.))
                             .text_color(MUTED)
+                            .truncate()
                             .child("최근 조언"),
                     )
                     .child(
                         div()
+                            .h(px(14.))
                             .text_size(px(10.))
                             .text_color(ADVISOR_PURPLE)
                             .truncate()
@@ -577,8 +627,10 @@ impl DashboardView {
                     )
                     .child(
                         div()
+                            .h(px(14.))
                             .text_size(px(10.))
                             .text_color(MUTED)
+                            .truncate()
                             .child("일상 턴에서는 침묵"),
                     ),
             )
@@ -586,14 +638,14 @@ impl DashboardView {
                 false,
                 "같은 오류 2회",
                 "┄┄▷",
-                self.anim_tick,
+                self.anim_secs,
                 active,
             ))
             .child(advisor_gate(
                 false,
                 "완료 전",
                 "┄┄▷",
-                self.anim_tick,
+                self.anim_secs,
                 active,
             ))
             .child(div().flex_1())
@@ -633,22 +685,22 @@ impl DashboardView {
             div()
                 .flex()
                 .flex_col()
-                .gap_2()
+                .gap_1()
                 .child(self.render_lead_card(snap))
                 .child(horizontal_wire(
                     self.verifier_motion(snap),
-                    self.anim_tick,
+                    self.anim_secs,
                 ))
                 .child(self.render_verifier_card(snap, vw))
         } else {
             div()
                 .flex()
                 .flex_row()
-                .gap_2()
+                .gap_1()
                 .child(self.render_lead_card(snap))
                 .child(horizontal_wire(
                     self.verifier_motion(snap),
-                    self.anim_tick,
+                    self.anim_secs,
                 ))
                 .child(self.render_verifier_card(snap, vw))
         };
@@ -656,24 +708,24 @@ impl DashboardView {
         div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .flex_1()
             .min_w_0()
             .w_full()
             .child(stage1)
-            // Lead → Decision Gate 수직 와이어 — 모션 중 주황 펄스 점이 내려간다.
-            .child(vertical_wire(self.lead_motion(snap), self.anim_tick))
+            // Lead → Decision Gate 수직 와이어 — 모션 중 주황 점이 매끄럽게 내려간다.
+            .child(vertical_wire(self.lead_motion(snap), self.anim_secs))
             // Stage 2 — Decision Gate · 분기 계층
             .child(self.render_decision_gate(snap))
             // Stage 3 — Workers 로의 팬아웃(동적 N스템 + 초과분 '+M개 추가' 배지)
             .child(branching_connector(
                 cols,
                 &stem_flags,
-                self.anim_tick,
+                self.anim_secs,
                 snap.workers.len(),
             ))
             .child(self.render_workers_section(snap, cx, cols))
-            .child(converging_connector(cols, &stem_flags, self.anim_tick))
+            .child(converging_connector(cols, &stem_flags, self.anim_secs))
             // Stage 4 — 다시 Lead · 리드
             .child(self.render_back_bar(snap))
     }
@@ -701,21 +753,19 @@ impl DashboardView {
             .iter()
             .any(|w| w.slot.as_str() != "lead" && worker_running(w));
         let motion = self.controller.demo_mode || lead_active(snap) || subordinates_running;
-        let (state_label, state_color) = if motion {
-            (
-                format!(
-                    "{} {}",
-                    spinner_char(self.anim_tick, 0),
-                    if subordinates_running || self.controller.demo_mode {
-                        "워커 조율 중"
-                    } else {
-                        "작업 중"
-                    }
-                ),
+        let state_pill = if motion {
+            spinner_pill(
+                spinner_char(self.anim_secs, 0),
+                if subordinates_running || self.controller.demo_mode {
+                    "워커 조율 중".to_string()
+                } else {
+                    "작업 중".to_string()
+                },
                 LEAD_ORANGE,
+                BG,
             )
         } else {
-            ("대기 중".to_string(), MUTED)
+            pill("대기 중", MUTED, BG)
         };
         let activity = match snap.workers.iter().find(|w| w.slot.as_str() == "lead") {
             Some(w) => redact_secrets(&w.activity),
@@ -727,7 +777,7 @@ impl DashboardView {
             .gap_1()
             .flex_1()
             .min_w_0()
-            .p_3()
+            .p_2()
             .rounded_lg()
             .bg(BG_ELEVATED)
             .border_2()
@@ -738,6 +788,7 @@ impl DashboardView {
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .min_h(px(18.))
                     .child(
                         div()
                             .text_size(px(13.))
@@ -747,19 +798,22 @@ impl DashboardView {
                             .child(format!("Lead · {}", model)),
                     )
                     .child(div().flex_1())
-                    .child(pill(state_label, state_color, BG)),
+                    .child(state_pill),
             )
             .child(
                 div()
-                    .text_size(px(11.))
+                    .h(px(16.))
+                    .text_size(px(10.))
                     .text_color(TEXT_SOFT)
                     .truncate()
                     .child(activity),
             )
             .child(
                 div()
+                    .h(px(14.))
                     .text_size(px(10.))
                     .text_color(MUTED)
+                    .truncate()
                     .child(format!("effort ▮▮▮▮ · profile={}", snap.profile_name)),
             )
     }
@@ -769,10 +823,15 @@ impl DashboardView {
     fn render_verifier_card(&self, snap: &DashboardSnapshot, vw: Pixels) -> gpui::Div {
         let active = self.verifier_motion(snap);
         let model = role_model_label(snap, "verifier");
-        let (badge, badge_color) = if active {
-            (format!("{} 검증 중", spinner_char(self.anim_tick, 0)), VERIFIER_NEON)
+        let badge_pill = if active {
+            spinner_pill(
+                spinner_char(self.anim_secs, 0),
+                "검증 중".to_string(),
+                VERIFIER_NEON,
+                BG,
+            )
         } else {
-            ("대기".to_string(), MUTED)
+            pill("대기", MUTED, BG)
         };
         let (status_label, status_color) = if active {
             ("◉ 계획·결과 교차 검토", VERIFIER_NEON)
@@ -783,7 +842,7 @@ impl DashboardView {
             .flex()
             .flex_col()
             .gap_1()
-            .p_3()
+            .p_2()
             .rounded_lg()
             .bg(if active { BG_GLOW_NEON } else { BG_ELEVATED })
             .border_2()
@@ -800,6 +859,7 @@ impl DashboardView {
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .min_h(px(18.))
                     .child(
                         div()
                             .text_size(px(13.))
@@ -809,18 +869,21 @@ impl DashboardView {
                             .child(format!("Verifier · {}", model)),
                     )
                     .child(div().flex_1())
-                    .child(pill(badge, badge_color, BG)),
+                    .child(badge_pill),
             )
-            // 진행 트랙 — 활성: 네온 알약이 좌→우 슬라이드 / 대기: 빈 트랙(위장 금지)
+            // 진행 트랙 — 활성: 네온 알약이 좌↔우 글라이드 / 대기: 빈 트랙(위장 금지).
+            // 높이는 양쪽 다 5px 고정 — 카드 높이 점프 없음.
             .child(if active {
-                sliding_pill_track(BG_NEON_TRACK, VERIFIER_NEON, self.anim_tick % 10)
+                sliding_pill_track(BG_NEON_TRACK, VERIFIER_NEON, self.anim_secs, 0)
             } else {
-                div().flex().w_full().h(px(6.)).rounded_full().bg(BG_NEON_TRACK)
+                div().flex().w_full().h(px(5.)).flex_none().rounded_full().bg(BG_NEON_TRACK)
             })
             .child(
                 div()
+                    .h(px(14.))
                     .text_size(px(10.))
                     .text_color(status_color)
+                    .truncate()
                     .child(status_label),
             )
     }
@@ -850,8 +913,8 @@ impl DashboardView {
         let mut panel = div()
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
+            .gap_1()
+            .p_2()
             .rounded_lg()
             .bg(BG_ELEVATED)
             .border_1()
@@ -862,9 +925,10 @@ impl DashboardView {
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .min_h(px(16.))
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(px(12.))
                             .font_weight(FontWeight::BOLD)
                             .text_color(GATE_GREEN)
                             .child("Decision Gate · 분기 계층"),
@@ -874,6 +938,7 @@ impl DashboardView {
                         div()
                             .text_size(px(10.))
                             .text_color(MUTED)
+                            .truncate()
                             .child(format!(
                                 "forks {} · 비용 {} · shadow {}",
                                 forks_label, cost_label, shadow_label
@@ -934,9 +999,10 @@ impl DashboardView {
         column
     }
 
-    /// 실행 중 워커 카드 1개 — 활동바 + 1줄 활동 + (제어 허용 시) 2단계 중단 버튼.
-    /// idx는 보이는 그리드 순서 — 스피너·슬라이딩 알약 위상을 워커마다 흩는다.
-    /// 폭 설정(중앙 max-w / flex_1)은 호출부에서 결정한다.
+    /// 실행 중 워커 카드 1개 — 활동바 + 1줄 활동 + 실측 경과 타이머(mm:ss) +
+    /// (제어 허용 시) 2단계 중단 버튼. idx는 보이는 그리드 순서 — 스피너·슬라이딩
+    /// 알약 위상을 워커마다 흩는다. 모든 줄이 고정 높이(truncate)라 형제 카드·연속
+    /// 프레임 사이에 세로 1px 흔들림도 없다. 폭 설정은 호출부에서 결정한다.
     fn render_worker_card(
         &self,
         w: &LiveWorkerInfo,
@@ -949,13 +1015,18 @@ impl DashboardView {
             && !self.controller.demo_mode;
         let running = w.status.as_deref() != Some("done");
         let frac = stable_activity_frac(&w.address);
+        // 실측 경과 — LIVE는 최초 관측 시각 기준, DEMO는 결정론적 표본값.
+        let elapsed_label = self
+            .controller
+            .worker_elapsed_secs(&w.address, Some(idx))
+            .map(format_elapsed_mmss);
 
         let mut actions = div().flex().flex_row().gap_2().items_center().min_w_0();
         if confirming {
             actions = actions
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(10.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(ROSE_DANGER)
                         .child("정말 중단?"),
@@ -964,12 +1035,12 @@ impl DashboardView {
                     div()
                         .id(SharedString::from(format!("kill-confirm-{}", w.address)))
                         .px_2()
-                        .h_6()
+                        .h(px(18.))
                         .flex()
                         .items_center()
                         .rounded_md()
                         .bg(ROSE_DANGER)
-                        .text_size(px(11.))
+                        .text_size(px(10.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(BG)
                         .cursor_pointer()
@@ -1015,13 +1086,13 @@ impl DashboardView {
                     div()
                         .id(SharedString::from(format!("kill-cancel-{}", w.address)))
                         .px_2()
-                        .h_6()
+                        .h(px(18.))
                         .flex()
                         .items_center()
                         .rounded_md()
                         .border_1()
                         .border_color(BORDER_HEADER)
-                        .text_size(px(11.))
+                        .text_size(px(10.))
                         .text_color(MUTED)
                         .cursor_pointer()
                         .child("취소")
@@ -1036,13 +1107,13 @@ impl DashboardView {
                 div()
                     .id(SharedString::from(format!("kill-ask-{}", w.address)))
                     .px_2()
-                    .h_6()
+                    .h(px(18.))
                     .flex()
                     .items_center()
                     .rounded_md()
                     .border_1()
                     .border_color(ROSE_DANGER)
-                    .text_size(px(11.))
+                    .text_size(px(10.))
                     .text_color(ROSE_DANGER)
                     .cursor_pointer()
                     .hover(|s| s.bg(ROSE_BG_HOVER))
@@ -1057,8 +1128,9 @@ impl DashboardView {
         div()
             .flex()
             .flex_col()
-            .gap_1p5()
-            .p_3()
+            .gap_1()
+            .p_2()
+            .min_h(px(96.))
             .rounded_lg()
             .bg(BG_ELEVATED)
             .border_1()
@@ -1070,6 +1142,7 @@ impl DashboardView {
                     .items_center()
                     .gap_2()
                     .min_w_0()
+                    .min_h(px(18.))
                     .child(pill(format!("[{}]", w.repo_tag), WORKER_BLUE, BG))
                     .child(
                         div()
@@ -1094,19 +1167,17 @@ impl DashboardView {
                             .child(w.short_model.clone()),
                     ),
             )
-            // 활동바 — 실행 중: WORKER_BLUE 알약이 좌→우 슬라이드(실시간 미정 진행),
-            // 완료: 주소 해시의 안정 채움(애니메이션 없음, 완료율 아님)
+            // 활동바 — 실행 중: WORKER_BLUE 알약이 좌↔우 연속 글라이드(실시간 미정
+            // 진행), 완료: 주소 해시의 안정 채움(애니메이션 없음, 완료율 아님).
+            // 양쪽 다 높이 5px 고정 — 카드 높이 점프 없음.
             .child(if running {
-                sliding_pill_track(
-                    BG_BLUE_TRACK,
-                    WORKER_BLUE,
-                    self.anim_tick.wrapping_add((idx as u64) * 3) % 10,
-                )
+                sliding_pill_track(BG_BLUE_TRACK, WORKER_BLUE, self.anim_secs, idx)
             } else {
                 div()
                     .flex()
                     .w_full()
                     .h(px(5.))
+                    .flex_none()
                     .rounded_full()
                     .bg(BG_BLUE_TRACK)
                     .overflow_hidden()
@@ -1120,6 +1191,7 @@ impl DashboardView {
             })
             .child(
                 div()
+                    .h(px(16.))
                     .text_size(px(10.))
                     .text_color(TEXT_SOFT)
                     .truncate()
@@ -1132,17 +1204,27 @@ impl DashboardView {
                     .items_center()
                     .gap_2()
                     .min_w_0()
-                    .child(
+                    .min_h(px(20.))
+                    .child(if running {
+                        spinner_status(
+                            spinner_char(self.anim_secs, idx),
+                            match &elapsed_label {
+                                Some(t) => format!("실행 중 · {}", t),
+                                None => "실행 중".to_string(),
+                            },
+                            WORKER_BLUE,
+                        )
+                    } else {
                         div()
                             .text_size(px(10.))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(if running { WORKER_BLUE } else { GATE_GREEN })
-                            .child(if running {
-                                format!("{} 실행 중", spinner_char(self.anim_tick, idx))
-                            } else {
-                                "✓ 완료".to_string()
-                            }),
-                    )
+                            .text_color(GATE_GREEN)
+                            .truncate()
+                            .child(match &elapsed_label {
+                                Some(t) => format!("✓ 완료 · {}", t),
+                                None => "✓ 완료".to_string(),
+                            })
+                    })
                     .child(div().flex_1())
                     .child(actions),
             )
@@ -1174,7 +1256,8 @@ impl DashboardView {
             .items_center()
             .gap_2()
             .px_3()
-            .py_2()
+            .py_1()
+            .min_h(px(26.))
             .rounded_lg()
             .bg(BG_ELEVATED)
             .border_1()
@@ -1182,7 +1265,7 @@ impl DashboardView {
             .child(div().flex_1())
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(11.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(LEAD_ORANGE)
                     .child("다시 Lead · 리드"),
@@ -1203,7 +1286,8 @@ impl DashboardView {
     // 4. 하단 세션 기록 패널 — decision_events 최신 이벤트 (역할 색 태그)
     // -----------------------------------------------------------------------
 
-    fn render_session_log(&self, snap: &DashboardSnapshot) -> gpui::Div {
+    fn render_session_log(&self, snap: &DashboardSnapshot, cx: &Context<Self>) -> gpui::Div {
+        let size = self.controller.log_panel_size;
         let mut panel = div()
             .flex()
             .flex_col()
@@ -1211,22 +1295,35 @@ impl DashboardView {
             .mx_4()
             .mb_2()
             .p_2()
+            .flex_none()
             .rounded_lg()
             .bg(BG_ELEVATED)
             .border_1()
             .border_color(BORDER_LOG)
+            // 헤더 바 — 제목·건수 + 크기 토글(접기/작게/크게, 현재 모드 강조)
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    .min_h(px(16.))
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .id("log-panel-cycle")
+                            .flex()
+                            .items_center()
+                            .text_size(px(11.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(TEXT_SOFT)
-                            .child("세션 기록"),
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(TEXT))
+                            .child("세션 기록")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                // 제목 클릭 — 크기 순환(접기→작게→크게)
+                                this.controller.cycle_log_panel_size();
+                                cx.notify();
+                            })),
                     )
                     .child(
                         div()
@@ -1235,6 +1332,9 @@ impl DashboardView {
                             .child(format!("{}건", snap.recent_log.len())),
                     )
                     .child(div().flex_1())
+                    .child(log_size_button(LogPanelSize::Compact, size, cx))
+                    .child(log_size_button(LogPanelSize::Expanded, size, cx))
+                    .child(log_size_button(LogPanelSize::Collapsed, size, cx))
                     .child(
                         div()
                             .text_size(px(9.))
@@ -1242,16 +1342,53 @@ impl DashboardView {
                             .child("decision_events · 읽기전용 조회"),
                     ),
             );
-        if snap.recent_log.is_empty() {
-            panel = panel.child(
-                div()
-                    .text_size(px(10.))
-                    .text_color(MUTED)
-                    .child("아직 기록된 결정 이벤트가 없습니다"),
-            );
-        } else {
-            for e in snap.recent_log.iter().take(8) {
-                panel = panel.child(log_line(e));
+        match size {
+            LogPanelSize::Collapsed => {
+                // 접힘 — 헤더 바만 남는다(1줄 높이).
+            }
+            LogPanelSize::Compact => {
+                // 작게(기본) — 3줄 고정 높이 본문.
+                if snap.recent_log.is_empty() {
+                    panel = panel.child(
+                        div()
+                            .h(px(16.))
+                            .text_size(px(10.))
+                            .text_color(MUTED)
+                            .truncate()
+                            .child("아직 기록된 결정 이벤트가 없습니다"),
+                    );
+                } else {
+                    let mut body = div().flex().flex_col().gap_1();
+                    for e in snap.recent_log.iter().take(size.visible_lines()) {
+                        body = body.child(log_line(e));
+                    }
+                    panel = panel.child(body);
+                }
+            }
+            LogPanelSize::Expanded => {
+                // 크게 — 8줄 창 + 내부 스크롤(패널 자체는 창을 밀어내지 않는다).
+                if snap.recent_log.is_empty() {
+                    panel = panel.child(
+                        div()
+                            .h(px(16.))
+                            .text_size(px(10.))
+                            .text_color(MUTED)
+                            .truncate()
+                            .child("아직 기록된 결정 이벤트가 없습니다"),
+                    );
+                } else {
+                    let mut body = div()
+                        .id("session-log-body")
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .max_h(px(size.visible_lines() as f32 * 17.0 + 4.0))
+                        .overflow_y_scroll();
+                    for e in snap.recent_log.iter() {
+                        body = body.child(log_line(e));
+                    }
+                    panel = panel.child(body);
+                }
             }
         }
         panel
@@ -1352,7 +1489,7 @@ impl Render for DashboardView {
             .child(self.render_header(&snap, cx))
             .child(self.render_legend_strip(&snap, cx))
             .child(self.render_topology_canvas(&snap, cx, vw))
-            .child(self.render_session_log(&snap))
+            .child(self.render_session_log(&snap, cx))
             .child(self.render_footer(&snap))
     }
 }
@@ -1455,6 +1592,83 @@ fn pill(text: impl Into<SharedString>, fg: Rgba, bg: Rgba) -> gpui::Div {
         .child(text.into())
 }
 
+/// 스피너 포함 상태 pill — 스피너 문자를 고정폭(12px) 박스에 담아 비례폭 글꼴의
+/// 글자별 폭 차가 pill 전체 폭을 흔들지 않게 한다(수평 무지터).
+fn spinner_pill(frame: char, text: String, fg: Rgba, bg: Rgba) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .h_5()
+        .rounded_md()
+        .bg(bg)
+        .border_1()
+        .border_color(fg)
+        .text_size(px(10.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(fg)
+        .child(div().w(px(12.)).flex_shrink_0().child(frame.to_string()))
+        .child(div().truncate().child(text))
+}
+
+/// 스피너 포함 상태 텍스트 1행 — 고정폭(14px) 스피너 박스 + truncate 텍스트.
+/// 워커 카드 하단 상태 줄('⠋ 실행 중 · 01:24')용(수평·수직 무지터).
+fn spinner_status(frame: char, text: String, color: Rgba) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .min_w_0()
+        .child(
+            div()
+                .w(px(14.))
+                .flex_shrink_0()
+                .text_size(px(10.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(color)
+                .child(frame.to_string()),
+        )
+        .child(
+            div()
+                .text_size(px(10.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(color)
+                .truncate()
+                .child(text),
+        )
+}
+
+/// 세션 기록 크기 토글 버튼 1개 — 현재 모드는 밝은 배경·테두리로 강조.
+fn log_size_button(
+    target: LogPanelSize,
+    current: LogPanelSize,
+    cx: &Context<DashboardView>,
+) -> gpui::Stateful<gpui::Div> {
+    let active = target == current;
+    div()
+        .id(SharedString::from(format!("log-size-{}", target.label())))
+        .flex()
+        .items_center()
+        .px_2()
+        .h(px(16.))
+        .rounded_sm()
+        .bg(if active { BG_CHROME } else { BG })
+        .border_1()
+        .border_color(if active { TEXT_SOFT } else { BORDER_LOG })
+        .hover(|s| s.border_color(TEXT_SOFT))
+        .text_size(px(9.))
+        .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+        .text_color(if active { TEXT } else { MUTED })
+        .cursor_pointer()
+        .child(target.label().to_string())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.controller.set_log_panel_size(target);
+            cx.notify();
+        }))
+}
+
 fn action_button(
     label: &str,
     id: &'static str,
@@ -1491,8 +1705,8 @@ fn repo_tab(
         .id(id)
         .flex()
         .items_center()
-        .px_3()
-        .h_7()
+        .px_2()
+        .h(px(20.))
         .rounded_md()
         .bg(if selected { BG_ELEVATED } else { BG })
         .border_1()
@@ -1507,15 +1721,15 @@ fn repo_tab(
 }
 
 /// Advisor 자문 게이트 1행 — 활성(●/━◈▶ 보라) ↔ 대기(◇/┄┄▷ 뮤트).
-/// 모션 중 활성 게이트 배지는 (anim_tick % 4) 농도로 숨쉰다(대기는 정지).
-fn advisor_gate(active: bool, label: &str, badge: &str, anim_tick: u64, motion: bool) -> gpui::Div {
+/// 모션 중 활성 게이트 배지는 사인 호흡(0.45..=1.0)으로 매끄럽게 숨쉰다(대기는 정지).
+fn advisor_gate(active: bool, label: &str, badge: &str, anim_secs: f32, motion: bool) -> gpui::Div {
     let (prefix, color, badge_color) = if active {
         ("●", ADVISOR_PURPLE, ADVISOR_PURPLE)
     } else {
         ("◇", MUTED, BORDER_ADVISORY_IDLE)
     };
     let badge_opacity = if active && motion {
-        [1.0f32, 0.65, 0.45, 0.65][(anim_tick % 4) as usize]
+        smooth_pulse_opacity(anim_secs, 0.9, 0.25, 0.45, 1.0)
     } else {
         1.0
     };
@@ -1524,11 +1738,13 @@ fn advisor_gate(active: bool, label: &str, badge: &str, anim_tick: u64, motion: 
         .flex_row()
         .items_center()
         .gap_2()
+        .min_h(px(16.))
         .child(
             div()
                 .text_size(px(11.))
                 .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
                 .text_color(color)
+                .truncate()
                 .child(format!("{} {}", prefix, label)),
         )
         .child(div().flex_1())
@@ -1541,9 +1757,11 @@ fn advisor_gate(active: bool, label: &str, badge: &str, anim_tick: u64, motion: 
         )
 }
 
-/// Lead ↔ Verifier 수평 와이어 — 대기: 중앙 점 정지, 검증 활동: 네온 점이
-/// 와이어 위를 좌→우 4단계로 스텝하며 농담 펄스(모션은 anim_tick이 멈추면 정지).
-fn horizontal_wire(neon: bool, anim_tick: u64) -> gpui::Div {
+/// Lead ↔ Verifier 수평 와이어 — 고정 h(14px) 트랙 위를 네온 점이 삼각파로
+/// 좌↔우 매끄럽게 왕복 글라이드한다(60fps). 점은 `.absolute().left(relative(..))`
+/// 오프셋으로만 움직이고 프레임마다 자식을 늬거나 빼지 않으니 레이아웃 점프가
+/// 없다. 대기: 중앙 점 정지(동일 지오메트리).
+fn horizontal_wire(neon: bool, anim_secs: f32) -> gpui::Div {
     let color = if neon { VERIFIER_NEON } else { BORDER_WIRE };
     let mut wire = div()
         .flex()
@@ -1552,27 +1770,45 @@ fn horizontal_wire(neon: bool, anim_tick: u64) -> gpui::Div {
         .min_w(px(36.))
         .flex_none();
     if neon {
-        let phase = (anim_tick % 4) as usize;
-        let glow = 0.7 + 0.3 * ((anim_tick % 2) as f32);
-        for i in 0..4 {
-            wire = if i == phase {
-                wire.child(
+        let t = continuous_phase(anim_secs, 0.7, 0.0);
+        let tri = if t < 0.5 { t * 2.0 } else { 2.0 - t * 2.0 }; // 0→1→0 왕복
+        let pos = tri * 0.86;
+        wire = wire.child(
+            div()
+                .relative()
+                .flex_1()
+                .h(px(14.))
+                .overflow_hidden()
+                .child(
                     div()
-                        .size_2()
-                        .rounded_full()
-                        .bg(VERIFIER_NEON)
-                        .opacity(glow)
-                        .flex_none(),
+                        .absolute()
+                        .top(px(6.))
+                        .left(px(0.))
+                        .w_full()
+                        .h(px(2.))
+                        .bg(color),
                 )
-            } else {
-                wire.child(div().flex_1().h(px(2.)).bg(color))
-            };
-        }
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(3.5))
+                        .left(relative(pos))
+                        .size(px(7.))
+                        .rounded_full()
+                        .bg(VERIFIER_NEON),
+                ),
+        );
     } else {
-        wire = wire
-            .child(div().flex_1().h(px(2.)).bg(color))
-            .child(div().size_2().rounded_full().bg(color).flex_none())
-            .child(div().flex_1().h(px(2.)).bg(color));
+        wire = wire.child(
+            div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .h(px(14.))
+                .child(div().flex_1().h(px(2.)).bg(color))
+                .child(div().size(px(7.)).rounded_full().bg(color).flex_none())
+                .child(div().flex_1().h(px(2.)).bg(color)),
+        );
     }
     wire.child(
         div()
@@ -1583,25 +1819,59 @@ fn horizontal_wire(neon: bool, anim_tick: u64) -> gpui::Div {
     )
 }
 
-/// Lead → Decision Gate 수직 와이어 — 대기: 중앙 점 정지, 모션 중: 주황 펄스
-/// 점이 와이어를 따라 위→아래 4단계로 내려간다(anim_tick 정지 시 정지).
-fn vertical_wire(glowing: bool, anim_tick: u64) -> gpui::Div {
+/// Lead → Decision Gate 수직 와이어 — 고정 h(18px) 트랙을 주황 점이 위→아래로
+/// 매끄럽게 미끄러진다(absolute 오프셋 — 레이아웃 점프 없음). 대기: 중앙 정지점.
+fn vertical_wire(glowing: bool, anim_secs: f32) -> gpui::Div {
     let mut wire = div().flex().flex_col().items_center();
+    let track = || {
+        div()
+            .relative()
+            .flex_none()
+            .w(px(7.))
+            .h(px(18.))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(2.5))
+                    .top(px(0.))
+                    .w(px(2.))
+                    .h(px(18.))
+                    .bg(BORDER_WIRE),
+            )
+    };
     if glowing {
-        let phase = (anim_tick % 4) as usize;
-        let top = px((phase * 8) as f32); // 0/8/16/24px — 점의 수직 위치
-        let bottom = px((24 - phase * 8) as f32);
-        wire = wire
-            .child(div().w(px(2.)).h(top).bg(BORDER_WIRE))
-            .child(div().size_2().rounded_full().bg(LEAD_ORANGE))
-            .child(div().w(px(2.)).h(bottom).bg(BORDER_WIRE));
+        let t = continuous_phase(anim_secs, 0.85, 0.0);
+        wire = wire.child(
+            track().child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(t * 11.0))
+                    .size(px(7.))
+                    .rounded_full()
+                    .bg(LEAD_ORANGE),
+            ),
+        );
     } else {
-        wire = wire
-            .child(div().w(px(2.)).h(px(10.)).bg(BORDER_WIRE))
-            .child(div().size_2().rounded_full().bg(BORDER_WIRE))
-            .child(div().w(px(2.)).h(px(10.)).bg(BORDER_WIRE));
+        wire = wire.child(
+            track().child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(5.5))
+                    .size(px(7.))
+                    .rounded_full()
+                    .bg(BORDER_WIRE),
+            ),
+        );
     }
-    wire.child(div().text_size(px(10.)).text_color(MUTED).child("▼"))
+    wire.child(
+        div()
+            .text_size(px(10.))
+            .text_color(MUTED)
+            .h(px(13.))
+            .child("▼"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1612,11 +1882,12 @@ fn vertical_wire(glowing: bool, anim_tick: u64) -> gpui::Div {
 // ---------------------------------------------------------------------------
 
 /// Decision Gate → Workers 팬아웃 커넥터 — 위임 라벨(+초과분 배지) + N스템 레일.
-fn branching_connector(n: usize, active: &[bool], anim_tick: u64, total: usize) -> gpui::Div {
+fn branching_connector(n: usize, active: &[bool], anim_secs: f32, total: usize) -> gpui::Div {
     let mut header = div()
         .flex()
         .flex_row()
         .items_center()
+        .min_h(px(14.))
         .gap_1()
         .child(
             div()
@@ -1642,12 +1913,12 @@ fn branching_connector(n: usize, active: &[bool], anim_tick: u64, total: usize) 
                 .child(format!("+{}개 추가", extra)),
         );
     }
-    stem_assembly(n, active, anim_tick, false, Some(header))
+    stem_assembly(n, active, anim_secs, false, Some(header))
 }
 
 /// Workers → 다시 Lead 팬인 커넥터 — 분기와 동일한 n·플래그의 수렴 미러.
-fn converging_connector(n: usize, active: &[bool], anim_tick: u64) -> gpui::Div {
-    stem_assembly(n, active, anim_tick, true, None)
+fn converging_connector(n: usize, active: &[bool], anim_secs: f32) -> gpui::Div {
+    stem_assembly(n, active, anim_secs, true, None)
 }
 
 /// N스템 어셈블리 — converging=false: 레일→점→스템(팬아웃), true: 스템→점→레일→▼.
@@ -1655,7 +1926,7 @@ fn converging_connector(n: usize, active: &[bool], anim_tick: u64) -> gpui::Div 
 fn stem_assembly(
     n: usize,
     active: &[bool],
-    anim_tick: u64,
+    anim_secs: f32,
     converging: bool,
     header: Option<gpui::Div>,
 ) -> gpui::Div {
@@ -1666,7 +1937,7 @@ fn stem_assembly(
     if n <= 1 {
         out = out.child(single_stem(
             active.first().copied().unwrap_or(false),
-            anim_tick,
+            anim_secs,
             0,
             converging,
         ));
@@ -1686,14 +1957,20 @@ fn stem_assembly(
                 .h(px(1.))
                 .bg(BORDER_WIRE)
         };
-        let dots = stem_dots_row(n, active, anim_tick);
-        let stems = stem_row(n, active);
+        let dots = stem_dots_row(n, active, anim_secs);
+        let stems = stem_row(n, active, anim_secs, converging);
         if converging {
             out = out
                 .child(stems)
                 .child(dots)
                 .child(rail)
-                .child(div().text_size(px(10.)).text_color(MUTED).child("▼"));
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(MUTED)
+                        .h(px(13.))
+                        .child("▼"),
+                );
         } else {
             out = out.child(rail).child(dots).child(stems);
         }
@@ -1701,38 +1978,91 @@ fn stem_assembly(
     out
 }
 
-/// 스템 행 — n개 flex_1 셀 중심에 2px 수직 스템(활성=WORKER_BLUE/대기=BORDER_WIRE).
-fn stem_row(n: usize, active: &[bool]) -> gpui::Div {
+/// 스템 행 — n개 flex_1 셀 중심에 고정 h(12px) 스템. 활성 스템은 WORKER_BLUE로
+/// 빛나며 5px 점이 스템 전체를 위→아래(수렴은 반대 방향)로 매끄럽게 글라이드한다.
+/// 점은 absolute 오프셋 전용이라 프레임 사이 높이 변화가 없다.
+fn stem_row(n: usize, active: &[bool], anim_secs: f32, converging: bool) -> gpui::Div {
+    const STEM_H: f32 = 12.0;
     let mut row = div().flex().flex_row().w_full();
     for i in 0..n {
-        let color = if active.get(i).copied().unwrap_or(false) {
-            WORKER_BLUE
-        } else {
-            BORDER_WIRE
-        };
-        row = row.child(
+        let is_active = active.get(i).copied().unwrap_or(false);
+        let color = if is_active { WORKER_BLUE } else { BORDER_WIRE };
+        let cell = if is_active {
+            let t = continuous_phase(anim_secs, 0.9, i as f32 * 0.31);
+            let travel = if converging { 1.0 - t } else { t };
             div()
-                .flex_1()
+                .relative()
+                .flex_none()
+                .w(px(7.))
+                .h(px(STEM_H))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(2.5))
+                        .top(px(0.))
+                        .w(px(2.))
+                        .h(px(STEM_H))
+                        .bg(color),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(1.))
+                        .top(px(travel * (STEM_H - 5.0)))
+                        .size(px(5.))
+                        .rounded_full()
+                        .bg(WORKER_BLUE),
+                )
+        } else {
+            div()
                 .flex()
-                .flex_col()
-                .items_center()
-                .child(div().w(px(2.)).h(px(10.)).bg(color)),
-        );
+                .flex_none()
+                .w(px(7.))
+                .h(px(STEM_H))
+                .flex_row()
+                .justify_center()
+                .child(div().w(px(2.)).h(px(STEM_H)).bg(color))
+        };
+        row = row.child(div().flex_1().flex().flex_row().justify_center().child(cell));
     }
     row
 }
 
-/// 스템 접점 행 — 활성 스템은 (anim_tick + idx) % 4 크기 펄스 점,
-/// 대기 스템은 작은 뮤트 점(펄스 없음 — 침묵).
-fn stem_dots_row(n: usize, active: &[bool], anim_tick: u64) -> gpui::Div {
+/// 스템 접점 행 — 활성 스템은 고정 12px 박스 안에서 사인 호흡(크기·불투명도)하는
+/// 발광 점(워커 idx별 위상 차등 — 모든 실행 워커에 뚜렷한 라이브 플로우),
+/// 대기 스템은 작은 뮤트 점(펄스 없음 — 침묵). 박스 높이가 고정이라 행 점프 없음.
+fn stem_dots_row(n: usize, active: &[bool], anim_secs: f32) -> gpui::Div {
+    const DOT_BOX: f32 = 12.0;
     let mut row = div().flex().flex_row().items_center().w_full();
     for i in 0..n {
         let dot = if active.get(i).copied().unwrap_or(false) {
-            let phase = ((anim_tick.wrapping_add(i as u64)) % 4) as usize;
-            let s = [8f32, 6., 4., 6.][phase];
-            div().w(px(s)).h(px(s)).rounded_full().bg(WORKER_BLUE)
+            let op = smooth_pulse_opacity(anim_secs, 0.8, i as f32 * 0.37, 0.35, 1.0);
+            let grow = smooth_pulse_opacity(anim_secs, 0.8, i as f32 * 0.37, 0.0, 1.0);
+            let s = 4.0 + 4.0 * grow;
+            let inset = (DOT_BOX - s) * 0.5;
+            div()
+                .relative()
+                .flex_none()
+                .size(px(DOT_BOX))
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(inset))
+                        .left(px(inset))
+                        .size(px(s))
+                        .rounded_full()
+                        .bg(WORKER_BLUE)
+                        .opacity(op),
+                )
         } else {
-            div().w(px(4.)).h(px(4.)).rounded_full().bg(BORDER_WIRE)
+            div()
+                .flex()
+                .flex_none()
+                .size(px(DOT_BOX))
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .child(div().size(px(4.)).rounded_full().bg(BORDER_WIRE))
         };
         row = row.child(div().flex_1().flex().flex_row().justify_center().child(dot));
     }
@@ -1740,25 +2070,85 @@ fn stem_dots_row(n: usize, active: &[bool], anim_tick: u64) -> gpui::Div {
 }
 
 /// 단일 스템(n==1) — 레일 없이 카드 중앙으로 곧장(수렴 모드는 점이 아래).
-fn single_stem(active: bool, anim_tick: u64, idx: usize, converging: bool) -> gpui::Div {
+/// 활성이면 호흡 접점 점 + 스템 글라이드 점(팬아웃/팬인 방향 반영).
+fn single_stem(active: bool, anim_secs: f32, idx: usize, converging: bool) -> gpui::Div {
     let color = if active { WORKER_BLUE } else { BORDER_WIRE };
-    let dot = if active {
-        let phase = ((anim_tick.wrapping_add(idx as u64)) % 4) as usize;
-        let s = [8f32, 6., 4., 6.][phase];
-        div().w(px(s)).h(px(s)).rounded_full().bg(WORKER_BLUE)
+    let junction = if active {
+        let op = smooth_pulse_opacity(anim_secs, 0.8, idx as f32 * 0.37, 0.35, 1.0);
+        let grow = smooth_pulse_opacity(anim_secs, 0.8, idx as f32 * 0.37, 0.0, 1.0);
+        let s = 4.0 + 4.0 * grow;
+        let inset = (12.0 - s) * 0.5;
+        div()
+            .relative()
+            .flex_none()
+            .size(px(12.))
+            .child(
+                div()
+                    .absolute()
+                    .top(px(inset))
+                    .left(px(inset))
+                    .size(px(s))
+                    .rounded_full()
+                    .bg(WORKER_BLUE)
+                    .opacity(op),
+            )
     } else {
-        div().w(px(4.)).h(px(4.)).rounded_full().bg(BORDER_WIRE)
+        div()
+            .flex()
+            .flex_none()
+            .size(px(12.))
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .child(div().size(px(4.)).rounded_full().bg(BORDER_WIRE))
     };
-    let stem = div().w(px(2.)).h(px(10.)).bg(color);
+    let stem = if active {
+        let t = continuous_phase(anim_secs, 0.9, idx as f32 * 0.31);
+        let travel = if converging { 1.0 - t } else { t };
+        div()
+            .relative()
+            .flex_none()
+            .w(px(7.))
+            .h(px(12.))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(2.5))
+                    .top(px(0.))
+                    .w(px(2.))
+                    .h(px(12.))
+                    .bg(color),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(1.))
+                    .top(px(travel * 7.0))
+                    .size(px(5.))
+                    .rounded_full()
+                    .bg(WORKER_BLUE),
+            )
+    } else {
+        div()
+            .flex()
+            .flex_none()
+            .w(px(7.))
+            .h(px(12.))
+            .flex_row()
+            .justify_center()
+            .child(div().w(px(2.)).h(px(12.)).bg(color))
+    };
     let cell = div().flex().flex_col().items_center();
     if converging {
-        cell.child(stem).child(dot)
+        cell.child(stem).child(junction)
     } else {
-        cell.child(dot).child(stem)
+        cell.child(junction).child(stem)
     }
 }
 
-/// 라우트 1행 — 라벨 + wide 확률 바 + p/표지/근거 태그 (TUI renderDecisionPanel 대응).
+/// 라우트 1행 — 단일 수평 행: 라벨(110px 고정) | flex_1 확률 바(h 6px) | 우측
+/// 통계(155px · text_right). 2행 스택이 아니라 한 줄로 컴팩트하게(TUI
+/// renderDecisionPanel 대응 — Decision Gate 계층의 수직 예산 절약).
 fn route_row(r: &RouteMetric) -> gpui::Div {
     let forced = r.forced_split;
     let split = forced || r.decision == DecisionLabel::Split;
@@ -1781,35 +2171,28 @@ fn route_row(r: &RouteMetric) -> gpui::Div {
     };
     div()
         .flex()
-        .flex_col()
-        .gap_1()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .min_w_0()
+        .min_h(px(14.))
+        .flex_none()
+        // 라벨 — 고정 폭 110px(줄바꿈 없는 1행, truncate)
         .child(
             div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .min_w_0()
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(if split { fill } else { TEXT })
-                        .truncate()
-                        .child(r.name.clone()),
-                )
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .text_size(px(10.))
-                        .font_weight(if forced { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                        .text_color(fill)
-                        .child(format!("p={:.2} {} · {}", r.p, badge, basis_label)),
-                ),
+                .w(px(110.))
+                .flex_none()
+                .text_size(px(10.))
+                .text_color(if split { fill } else { TEXT })
+                .truncate()
+                .child(r.name.clone()),
         )
+        // 확률 바 — 나머지 폭 전부(h 6px 고정)
         .child(
             div()
                 .flex()
-                .w_full()
+                .flex_1()
+                .min_w_0()
                 .h(px(6.))
                 .rounded_full()
                 .bg(track)
@@ -1821,6 +2204,18 @@ fn route_row(r: &RouteMetric) -> gpui::Div {
                         .rounded_full()
                         .bg(fill),
                 ),
+        )
+        // 우측 통계 — 고정 폭 155px 우측 정렬 1행
+        .child(
+            div()
+                .w(px(155.))
+                .flex_none()
+                .text_size(px(10.))
+                .font_weight(if forced { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                .text_color(fill)
+                .text_right()
+                .truncate()
+                .child(format!("p={:.2} {} · {}", r.p, badge, basis_label)),
         )
 }
 
@@ -1846,8 +2241,9 @@ fn blueprint_slot_card(slot: &str, model: &str) -> gpui::Div {
     div()
         .flex()
         .flex_col()
-        .gap_1p5()
-        .p_3()
+        .gap_1()
+        .p_2()
+        .min_h(px(96.))
         .rounded_lg()
         .bg(BG)
         .border_1()
@@ -1862,11 +2258,13 @@ fn blueprint_slot_card(slot: &str, model: &str) -> gpui::Div {
                 .items_center()
                 .gap_2()
                 .min_w_0()
+                .min_h(px(18.))
                 .child(
                     div()
                         .text_size(px(12.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(TEXT_SOFT)
+                        .truncate()
                         .child(slot.to_string()),
                 )
                 .child(div().flex_1())
@@ -1879,15 +2277,25 @@ fn blueprint_slot_card(slot: &str, model: &str) -> gpui::Div {
         )
         .child(
             div()
+                .h(px(14.))
                 .text_size(px(10.))
                 .text_color(MUTED)
                 .truncate()
                 .child(model.to_string()),
         )
-        // 빈 트랙 — 채움 0 (대기 상태 위장 금지)
-        .child(div().flex().w_full().h(px(5.)).rounded_full().bg(BG_BLUE_TRACK))
+        // 빈 트랙 — 채움 0 (대기 상태 위장 금지), 높이는 실행 카드와 동일 5px
         .child(
             div()
+                .flex()
+                .w_full()
+                .h(px(5.))
+                .flex_none()
+                .rounded_full()
+                .bg(BG_BLUE_TRACK),
+        )
+        .child(
+            div()
+                .h(px(16.))
                 .text_size(px(10.))
                 .text_color(DIM)
                 .truncate()
@@ -1903,12 +2311,15 @@ fn log_line(e: &RecentLogEntry) -> gpui::Div {
         .items_center()
         .gap_2()
         .min_w_0()
+        .h(px(16.))
+        .flex_none()
         .child(
             div()
                 .w(px(56.))
                 .flex_none()
                 .text_size(px(10.))
                 .text_color(DIM)
+                .truncate()
                 .child(e.time_hhmmss.clone()),
         )
         .child(
@@ -1965,26 +2376,32 @@ fn stable_activity_frac(key: &str) -> f32 {
     0.15 + v * 0.75
 }
 
-/// 미정 진행 슬라이딩 트랙 — 10칸 위를 알약(pill)이 좌→우로 스텝 이동한다.
-/// step은 (anim_tick + idx*3) % 10 — 완료율이 아니라 '진행 중' 표시등이며,
-/// anim_tick이 멈추는 유휴에는 알약도 정지한다(가짜 진행 금지).
-fn sliding_pill_track(track_bg: Rgba, pill: Rgba, step: u64) -> gpui::Div {
-    let mut track = div()
+/// 미정 진행 슬라이딩 트랙 — 알약(폭 28%)이 continuous_phase 삼각파로 0..72%를
+/// 좌↔우 매끄럽게 왕복 글라이드한다(60fps · 위상은 워커 idx로 분산).
+/// 완료율이 아니라 '진행 중' 표시등이며, anim_secs가 멈추는 유휴에는 알약도
+/// 정지한다(가짜 진행 금지). 높이 5px 고정 — 카드 높이 점프 없음.
+fn sliding_pill_track(track_bg: Rgba, pill: Rgba, anim_secs: f32, idx: usize) -> gpui::Div {
+    let t = continuous_phase(anim_secs, 0.75, idx as f32 * 0.29);
+    let tri = if t < 0.5 { t * 2.0 } else { 2.0 - t * 2.0 }; // 0→1→0 왕복
+    let pos = tri * 0.72;
+    div()
         .flex()
         .flex_row()
         .w_full()
         .h(px(5.))
+        .flex_none()
         .rounded_full()
         .bg(track_bg)
-        .overflow_hidden();
-    for s in 0..10u64 {
-        track = if s == step {
-            track.child(div().w(px(16.)).h_full().flex_none().rounded_full().bg(pill))
-        } else {
-            track.child(div().flex_1().h_full().min_w_0())
-        };
-    }
-    track
+        .overflow_hidden()
+        .child(div().w(relative(pos)).h_full().flex_none())
+        .child(
+            div()
+                .w(relative(0.28))
+                .h_full()
+                .flex_none()
+                .rounded_full()
+                .bg(pill),
+        )
 }
 
 /// ms → 사람이 읽는 시간 ("1h 23m" · "4m 05s" · "42s").

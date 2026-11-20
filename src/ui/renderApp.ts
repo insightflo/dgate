@@ -8,6 +8,7 @@ import {
 } from '../core/width.ts';
 import { LOG_FILTER_LABELS, TRIGGER_LABELS, effortToGauge, getFilteredLogs, sortRoutesForDisplay } from '../state/store.ts';
 import { THEME, lerpColor, resolveColorKey, type RGB } from '../theme.ts';
+import { applyLiveRolePanels, createLiveRoleTrail, formatElapsedMmss } from '../cli.ts';
 import type { AppState, SwarmCard } from '../types.ts';
 import { computeLayout, maxCardSlotsFor, type CompactLayout, type FullLayout } from './layout.ts';
 import { renderModalOverlay } from './renderModal.ts';
@@ -935,7 +936,9 @@ function renderSwarmSection(buf: CellBuffer, state: AppState, L: FullLayout): vo
         buf.writeText(
           startX + barW + 1,
           cy,
-          `${spinnerFrame(state.simTime, idx)} RUN`,
+          typeof card.elapsedSec === 'number'
+            ? `${spinnerFrame(state.simTime, idx)} ${formatElapsedMmss(card.elapsedSec)}`
+            : `${spinnerFrame(state.simTime, idx)} RUN`,
           THEME.blue,
           cardBg,
           true
@@ -961,7 +964,9 @@ function renderSwarmSection(buf: CellBuffer, state: AppState, L: FullLayout): vo
       const label = isErr
         ? '✕ 오류'
         : isDone
-          ? '✓ 완료'
+          ? typeof card.elapsedSec === 'number'
+            ? `✓ 완료 · ${formatElapsedMmss(card.elapsedSec)}`
+            : '✓ 완료'
           : isIdle
             ? '▪ 대기 중'
             : motion
@@ -1322,7 +1327,7 @@ function renderCompactLayout(buf: CellBuffer, state: AppState, L: CompactLayout)
       const barW = Math.max(10, iw - 28);
       if (motion && c.status === 'running' && c.progress === 0) {
         drawIndeterminateBar(buf, ix + 11, cy, barW, THEME.blue, THEME.bgBlueTrack, state.simTime, idx);
-        buf.writeRight(ix, cy, iw, `${spinnerFrame(state.simTime, idx)} RUN`, THEME.blue, THEME.bg, true);
+        buf.writeRight(ix, cy, iw, typeof c.elapsedSec === 'number' ? `${spinnerFrame(state.simTime, idx)} ${formatElapsedMmss(c.elapsedSec)}` : `${spinnerFrame(state.simTime, idx)} RUN`, THEME.blue, THEME.bg, true);
       } else {
         buf.drawProgressBar(ix + 11, cy, barW, c.progress / 100, THEME.blue, THEME.bgBlueTrack);
         const runningSpin = motion && c.status === 'running' && c.progress < 100;
@@ -1331,7 +1336,13 @@ function renderCompactLayout(buf: CellBuffer, state: AppState, L: CompactLayout)
           cy,
           iw,
           `${c.progress}% ${
-            c.progress >= 100 ? '✓완료' : runningSpin ? `${spinnerFrame(state.simTime, idx)} 실행` : '◉실행'
+            c.progress >= 100
+              ? typeof c.elapsedSec === 'number'
+                ? `✓완료 · ${formatElapsedMmss(c.elapsedSec)}`
+                : '✓완료'
+              : runningSpin
+                ? `${spinnerFrame(state.simTime, idx)} 실행`
+                : '◉실행'
           }`,
           c.progress >= 100 ? THEME.green : THEME.blue,
           THEME.bg
