@@ -10,7 +10,7 @@ description: Use when dispatching multi-CLI workers (pi/devin/agy via hc), runni
 ## 0. 단독 실행 원칙 (Zero External Dependency)
 
 - **네이티브 `dg`/`dgate` 바이너리 상호 호환**: Rust v2 네이티브 바이너리(`target/release/dg`·`dgate`, 또는 PATH에 설치된 경우)가 있으면 `node $DGATE_ROOT/src/decision/dg.ts` 대신 그대로 사용할 수 있다 — 동일 SQLite DB·roster.json SSOT를 공유하고 기동 ~3ms(Node 대비 약 24배 빠름)다. 문서의 `node $DGATE_ROOT/src/decision/dg.ts <cmd>`는 네이티브 `dg <cmd>`로 1:1 치환 가능하다.
-- **데스크톱 모니터(GPUI 앱)**: 사용자가 *"데스크톱 모니터 열어줘"*, *"GPUI 앱 열어줘"*라고 하면 `cargo run -p dgate-gui -- [--repo <dir>]`로 기동한다(빌드돼 있으면 `target/debug/dgate-gui` 또는 `target/release/dgate-gui`를 직접 실행). 편의 스크립트: `npm run gui:run -- --repo <dir>`.
+- **데스크톱 모니터(GPUI 앱)**: 사용자가 *"데스크톱 모니터 열어줘"*, *"GPUI 앱 열어줘"*라고 하면 `cargo run -p dgate-gui -- [--repo <dir>]`로 기동한다(빌드돼 있으면 `target/debug/dgate-gui` 또는 `target/release/dgate-gui`를 직접 실행). 편의 스크립트: `npm run dgate-gui -- --repo <dir>`.
 
 - **필수 요구사항은 `Node.js >= 22.6` + 이 저장소뿐이다.** npm 의존성 0개 — `npm install` 없이 `node` 하나로 `dg` 전 기능이 동작한다.
 - 이 문서에 등장하는 모든 외부 도구·서비스는 **전부 선택(OPTIONAL)**이다: `todo-flow`, `mistology`, `effort-router`, `neverstuck`, `GEMINI_DECISION_API_KEY`(Decision API), `hc`/멀티 CLI 워커. **설치돼 있지 않으면 해당 단계를 조용히 스킵한다** — 없다고 실패하거나 중단하지 않는다.

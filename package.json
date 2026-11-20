@@ -12,6 +12,7 @@
     "start": "node ./src/cli.ts --live",
     "live": "node ./src/cli.ts --live",
     "watch": "node ./src/cli.ts --watch",
+    "dgate-tui": "node ./src/cli.ts --watch",
     "demo": "node ./src/cli.ts --demo",
     "stream:sample": "node ./src/cli.ts --file ./examples/sample-session.jsonl",
     "stream:live": "node ./examples/emit-live-stream.ts | node ./src/cli.ts --stream",
@@ -27,7 +28,7 @@
     "rust:build": "cargo build --release",
     "rust:test": "cargo test",
     "gui:build": "cargo build -p dgate-gui",
-    "gui:run": "cargo run -p dgate-gui --"
+    "dgate-gui": "cargo run -p dgate-gui --"
   },
   "engines": {
     "node": ">=22.6.0"

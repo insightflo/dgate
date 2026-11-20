@@ -521,12 +521,18 @@ function main(): void {
 
   // N8: --watch-db > DGATE_DB_PATH > DECISION_ORCHESTRATOR_DB_PATH > GEMINI_TRICK_DB_PATH(레거시) > 기본 경로
   // 우선순위로 SQLite 결정 DB 읽기전용 구독.
+  // watch 모드에서 스냅샷·데모가 아니면 기본 경로 DB가 존재할 때 자동 연결한다
+  // (DB가 없으면 만들지 않고 건너뛴다 — 스냅샷/데모 테스트 결정성 유지).
   // W1은 최초 1회 로드만 수행한다(주기 구독 훅은 W2-B가 src/state에 추가).
   const decisionDbPath = resolveDbPath(opts.watchDb);
-  if (
-    (opts.watchDb !== null || process.env.DGATE_DB_PATH || process.env.DECISION_ORCHESTRATOR_DB_PATH || process.env.GEMINI_TRICK_DB_PATH) &&
-    fs.existsSync(decisionDbPath)
-  ) {
+  const dbExplicitlyRequested =
+    opts.watchDb !== null ||
+    process.env.DGATE_DB_PATH ||
+    process.env.DECISION_ORCHESTRATOR_DB_PATH ||
+    process.env.GEMINI_TRICK_DB_PATH;
+  const defaultDbAutoConnect =
+    opts.mode === 'watch' && !opts.snapshotPlain && !opts.snapshotAnsi;
+  if ((dbExplicitlyRequested || defaultDbAutoConnect) && fs.existsSync(decisionDbPath)) {
     try {
       // `--repo` 지정 시 해당 레포의 projectId로 스코프(경유 cwd → 내부 projectId 환산)
       const snapshot = readTelemetrySnapshot(

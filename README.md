@@ -61,7 +61,8 @@ node ./src/decision/dg.ts wrap --route tool_select --tool-class shell_exec -- ec
 node ./src/decision/dg.ts stats --cost --timing && node ./src/decision/dg.ts report    # dg stats / report — 비용·타이밍 통계, 규칙 후보 리포트
 ```
 
-- (선택) 실시간 TUI 모니터: `node ./src/cli.ts --watch-db ~/.local/state/dgate/decision.db --watch`
+- (선택) 실시간 TUI 모니터: `npm run dgate-tui` (기본값 현재 세션 관측, 기본 결정 DB가 있으면 자동 연결 · 전체 세션/프로젝트는 `npm run dgate-tui -- --all`)
+- (선택) GPUI 데스크톱 관제앱: `npm run dgate-gui` (Rust 빌드 필요 — [§7](#7-rust-v2-네이티브-cli--선택적-gpui-데스크톱-관제앱))
 - (선택) 에이전트 스킬로 연동하려면: [skills/dgate/SKILL.md](skills/dgate/SKILL.md)
 
 ### 빠른 시작
@@ -262,7 +263,9 @@ node ./src/decision/dg.ts <command> [flags]
 ```bash
 npm run demo          # 40초 데모 시나리오 (모델 호출 없음)
 npm run live          # 대화형 라이브 모드
-npm run watch         # 실행 중인 세션 트랜스크립트·결정 DB 실시간 관제
+npm run watch         # 실행 중인 세션 트랜스크립트·결정 DB 실시간 관제 (dgate-tui의 별칭)
+npm run dgate-tui     # 기본 관제 TUI — 현재 세션 기준, 기본 결정 DB 자동 연결 (`--all`로 전체 세션/프로젝트)
+npm run dgate-gui     # GPUI 데스크톱 관제앱 (cargo run -p dgate-gui)
 node ./src/cli.ts --watch --repo /path/to/your-project            # 저장소 단위 모니터 (--repo <dir>)
 npm run snapshot      # 현재 상태 정적 스냅샷 출력
 agy --output-format stream-json --print "…" | node ./src/cli.ts --stream   # JSONL 파이프 관제
@@ -294,7 +297,7 @@ default-members = ["crates/dgate-core", "crates/dgate-cli"]
 
 ```bash
 npm run gui:build    # = cargo build -p dgate-gui
-npm run gui:run      # = cargo run -p dgate-gui --
+npm run dgate-gui    # = cargo run -p dgate-gui --
 # 또는 직접:
 cargo run -p dgate-gui -- [--repo <dir>] [--db <path>] [--roster <path>] [--watch-only] [--poll-ms 2000]
 ```
