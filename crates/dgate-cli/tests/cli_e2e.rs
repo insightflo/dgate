@@ -894,10 +894,33 @@ fn test_09_pipeline_init_step_status_lifecycle() {
     let envs: [(&str, &str); 0] = [];
 
     let brief = base.join("brief.md");
-    std::fs::write(&brief, "# brief\n\n## Spec\n- x\n").unwrap();
+    std::fs::write(&brief, "# brief\n\n## Spec\n- `src/app.rs:10-40` 수정\n").unwrap();
     let brief_s = brief.display().to_string();
 
-    // ---------- init → SpawnCoder + 상태 파일 생성 ----------
+    // ---------- 앵커 없는 브리프 → 자동 ExploreRunning → explore-ok → CoderRunning ----------
+    let vague_brief = base.join("vague-brief.md");
+    std::fs::write(&vague_brief, "# brief\n\n## Spec\n- 검색 UX 개선\n").unwrap();
+    let init_exp = dg_json(
+        &[
+            "pipeline", "init", "--fork", "fk_pipe_exp", "--brief", &vague_brief.display().to_string(),
+            "--branch", "feat/pipe-exp", "--coder-model", "codex-gpt5", "--verifier-model", "glm-5.3",
+            "--state-dir", &sd,
+        ],
+        &envs,
+    );
+    assert_eq!(init_exp["phase"], "explore_running");
+    assert_eq!(init_exp["next_action"]["kind"], "spawn_explore");
+    let step_exp = dg_json(
+        &[
+            "pipeline", "step", "--fork", "fk_pipe_exp", "--event", "explore-ok",
+            "--context-map", ".herdr/context/fk_pipe_exp-map.md", "--state-dir", &sd,
+        ],
+        &envs,
+    );
+    assert_eq!(step_exp["phase"], "coder_running");
+    assert_eq!(step_exp["next_action"]["kind"], "spawn_coder");
+
+    // ---------- init(앵커 있음) → SpawnCoder + 상태 파일 생성 ----------
     let init = dg_json(
         &[
             "pipeline", "init", "--fork", "fk_pipe1", "--brief", &brief_s,

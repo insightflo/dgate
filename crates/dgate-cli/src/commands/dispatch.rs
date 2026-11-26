@@ -279,6 +279,8 @@ struct DispatchPlan {
     role_summary: Map<String, Value>,
     sharp_threshold: f64,
     decision_api: Option<Value>,
+    /// 쓰기 태스크 브리프에 파일·줄번호 코드 앵커가 없을 때 경량 explore 선행을 권고한다.
+    suggest_explore_first: bool,
 }
 
 struct PlanInput {
@@ -343,6 +345,7 @@ fn empty_plan(run_id: &str, db_path: &str) -> DispatchPlan {
         role_summary: Map::new(),
         sharp_threshold: engine::SHARP_P_THRESHOLD,
         decision_api: None,
+        suggest_explore_first: false,
     }
 }
 
@@ -757,6 +760,13 @@ fn plan_dispatch_inner(input: &PlanInput, api: Option<&ApiOverride>) -> Dispatch
         plan.role_summary.insert(slot.as_str().to_string(), json!(label));
     }
     plan.sharp_threshold = sharp_threshold;
+    if spec.requires_write {
+        if let Some(bp) = brief_path {
+            if let Ok(text) = std::fs::read_to_string(bp) {
+                plan.suggest_explore_first = !dgate_core::pipeline::brief_has_code_anchors(&text);
+            }
+        }
+    }
     if let Some(sn) = &plan.session_name {
         if !session_name_ok(sn) {
             plan.ok = false;
@@ -805,6 +815,11 @@ fn plan_to_json(plan: &DispatchPlan) -> Value {
             m.remove("decision_api");
         }
     }
+    if plan.suggest_explore_first {
+        if let Some(m) = v.as_object_mut() {
+            m.insert("suggestExploreFirst".to_string(), json!(true));
+        }
+    }
     v
 }
 
@@ -849,6 +864,12 @@ fn render_plan(plan: &DispatchPlan) {
     }
     if let Some(c) = &plan.carbon_brief_path {
         let _ = writeln!(out, "  carbon brief: {c}");
+    }
+    if plan.suggest_explore_first {
+        let _ = writeln!(
+            out,
+            "  [hint] 브리프에 파일·줄번호 앵커가 없습니다 — 경량 explore 선행(dg pipeline init --with-explore 또는 dg dispatch --task-kind code_search) 권장"
+        );
     }
     if let Some(a) = &plan.decision_api {
         let mode = a.get("mode").and_then(|v| v.as_str()).unwrap_or("?");
@@ -1388,6 +1409,39 @@ blast_radius: 테스트 경로 전반
             "프롬프트 끝에 브리프=경로 문장 주입: {prompt}"
         );
         assert!(!plan.hc_commands[0].join(" ").contains("{brief}"), "플레이스홀더 잔존 금지");
+        std::fs::remove_dir_all(db.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn write_brief_without_code_anchors_sets_suggest_explore_first() {
+        let db = temp_db_path("explore-hint");
+        let vague_brief = db.parent().unwrap().join("vague.md");
+        std::fs::write(
+            &vague_brief,
+            "## Standards\n깔끔하게 구현\n## Spec\n검색 UX를 개선한다.\n## Merge Danger\ndoor: two-way\nblast_radius: 홈 검색 화면\n",
+        )
+        .unwrap();
+        let anchored_brief = db.parent().unwrap().join("anchored.md");
+        std::fs::write(
+            &anchored_brief,
+            "## Standards\n깔끔하게 구현\n## Spec\n`HomeCatalogView.vue:120-180` 디바운스 수정\n## Merge Danger\ndoor: two-way\nblast_radius: 홈 검색 화면\n",
+        )
+        .unwrap();
+
+        let mut input = plan_input(&db.display().to_string(), None);
+        input.task_kind = "multi_edit".to_string();
+        input.dry_run = true;
+        input.db_path = None;
+        input.brief_file = Some(vague_brief.display().to_string());
+        let plan_vague = plan_dispatch_inner(&input, None);
+        assert!(plan_vague.suggest_explore_first);
+        assert_eq!(plan_to_json(&plan_vague)["suggestExploreFirst"], json!(true));
+
+        input.brief_file = Some(anchored_brief.display().to_string());
+        let plan_anchored = plan_dispatch_inner(&input, None);
+        assert!(!plan_anchored.suggest_explore_first);
+        assert!(plan_to_json(&plan_anchored).get("suggestExploreFirst").is_none());
+
         std::fs::remove_dir_all(db.parent().unwrap()).ok();
     }
 

@@ -26,13 +26,77 @@ pub const PIPELINE_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_MAX_REWORKS: u32 = 2;
 /// 기본 상태 디렉터리(저장소 cwd 기준 상대 경로).
 pub const DEFAULT_STATE_DIR: &str = ".herdr/pipelines";
+/// 기본 사전 탐색 Context Pack 디렉터리(저장소 cwd 기준 상대 경로).
+pub const DEFAULT_CONTEXT_DIR: &str = ".herdr/context";
+
+/// fork별 기본 Context Pack 경로(`.herdr/context/<fork_id>-map.md`).
+pub fn default_context_map_path(fork_id: &str) -> String {
+    format!("{DEFAULT_CONTEXT_DIR}/{fork_id}-map.md")
+}
+
+/// 브리프 본문에 코더가 바로 구현에 들어갈 수 있는 코드 앵커(파일 경로·줄번호·Context Pack)가
+/// 충분한지 판정한다(순수 함수 — `dg pipeline init`과 `dg dispatch`가 공유).
+///
+/// 통과 기준(하나라도 충족 시 `true` = 사전 탐색 스킵 가능):
+/// 1. `## Context Pack` 또는 `## Target Anchors` 헤딩 존재
+/// 2. `파일명.확장자:줄번호` 또는 `파일명.확장자#L줄번호` 형태 앵커 1건 이상
+/// 3. `.herdr/` 외 실제 소스/설정 파일 경로 2건 이상
+pub fn brief_has_code_anchors(text: &str) -> bool {
+    const SOURCE_EXTS: &[&str] = &[
+        ".rs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", ".py", ".go",
+        ".java", ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp", ".rb", ".php", ".cs",
+        ".html", ".css", ".scss", ".sql", ".toml", ".yaml", ".yml", ".json",
+    ];
+    let mut source_paths = std::collections::BTreeSet::new();
+
+    for raw_line in text.lines() {
+        let trimmed = raw_line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("## context pack") || lower.starts_with("## target anchors") {
+            return true;
+        }
+        for raw_tok in trimmed.split(|c: char| {
+            c.is_whitespace() || matches!(c, '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';')
+        }) {
+            let tok = raw_tok.trim_matches(|c: char| matches!(c, '*' | '_' | '.'));
+            if tok.is_empty() || tok.starts_with("http://") || tok.starts_with("https://") {
+                continue;
+            }
+            if tok.contains(".herdr/") {
+                continue;
+            }
+            // `file.ext:123` 또는 `file.ext#L123` 형태 앵커
+            for ext in SOURCE_EXTS {
+                if let Some(idx) = tok.find(ext) {
+                    let after = &tok[idx + ext.len()..];
+                    if let Some(rest) = after.strip_prefix(':') {
+                        if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                            return true;
+                        }
+                    }
+                    if let Some(rest) = after.strip_prefix("#L").or_else(|| after.strip_prefix("#l")) {
+                        if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                            return true;
+                        }
+                    }
+                    if after.is_empty() && tok.contains('/') {
+                        source_paths.insert(tok.to_string());
+                    }
+                }
+            }
+        }
+    }
+    source_paths.len() >= 2
+}
 
 /// 파이프라인 위상 — 종결(terminal) 위상은 ReadyPr·Escalated·Failed다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PipelinePhase {
-    /// 생성 직후(coder 미스폰). init 액션과 함께 즉시 CoderRunning으로 전이된다.
+    /// 생성 직후(워커 미스폰). init 액션과 함께 ExploreRunning 또는 CoderRunning으로 전이된다.
     Init,
+    /// 경량 읽기전용 explore 워커가 Context Pack(`.herdr/context/<fork_id>-map.md`) 생성 중.
+    ExploreRunning,
     /// coder 워커 실행 중(첫 스폰).
     CoderRunning,
     /// verifier 워커 실행 중(coder exit 0 이후).
@@ -55,6 +119,7 @@ impl PipelinePhase {
     pub fn as_str(&self) -> &'static str {
         match self {
             PipelinePhase::Init => "init",
+            PipelinePhase::ExploreRunning => "explore_running",
             PipelinePhase::CoderRunning => "coder_running",
             PipelinePhase::VerifierRunning => "verifier_running",
             PipelinePhase::ReworkPending => "rework_pending",
@@ -107,6 +172,10 @@ pub struct PipelineState {
     pub coder_model: String,
     pub verifier_model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explore_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_map_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_verdict_path: Option<String>,
@@ -131,11 +200,22 @@ pub struct PipelineInit {
     pub max_reworks: u32,
     pub coder_model: String,
     pub verifier_model: String,
+    /// `true`면 코더 투입 전 경량 읽기전용 `explore` 단계를 먼저 실행해 Context Pack을 만든다.
+    pub with_explore: bool,
+    /// 경량 탐색 워커 모델(미지정 시 로스터 `explore` 슬롯 기본값 사용).
+    pub explore_model: Option<String>,
 }
 
 /// 상태머신 입력 이벤트 — 외부 실행기(hc/러너)의 관측 결과만 받는다.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PipelineEvent {
+    /// 경량 explore(사전 탐색) 종료 — 성공 시 context_map_path를 코더 프롬프트에 주입하고,
+    /// 실패/스톨해도 fail-open으로 바로 CoderRunning으로 전이한다.
+    ExploreExited {
+        exit_code: i32,
+        context_map_path: Option<String>,
+        stalled: bool,
+    },
     /// coder 프로세스 종료 — `exit_code != 0` 또는 `stalled`면 실패 경로.
     CoderExited {
         exit_code: i32,
@@ -162,6 +242,13 @@ pub enum PipelineEvent {
 pub enum PipelineAction {
     /// 전이 없음(종결 위상 이벤트 무시 등).
     None,
+    /// 경량 읽기전용 explore 워커 스폰 — Context Pack(`.herdr/context/<fork_id>-map.md`) 생성.
+    SpawnExplore {
+        fork_id: String,
+        context_map_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        explore_model: Option<String>,
+    },
     /// coder (재)스폰 — attempt는 이번 실행의 재작업 번호.
     SpawnCoder {
         attempt: u32,
@@ -203,6 +290,7 @@ impl PipelineAction {
     pub fn label(&self) -> &'static str {
         match self {
             PipelineAction::None => "none",
+            PipelineAction::SpawnExplore { .. } => "spawn_explore",
             PipelineAction::SpawnCoder { .. } => "spawn_coder",
             PipelineAction::SpawnVerifier { .. } => "spawn_verifier",
             PipelineAction::BackpropAndRespawnCoder { .. } => "backprop_and_respawn_coder",
@@ -215,6 +303,7 @@ impl PipelineAction {
 
 fn event_label(event: &PipelineEvent) -> &'static str {
     match event {
+        PipelineEvent::ExploreExited { .. } => "explore_exited",
         PipelineEvent::CoderExited { .. } => "coder_exited",
         PipelineEvent::VerdictReceived { .. } => "verdict_received",
         PipelineEvent::AdvisorG3Result { .. } => "advisor_g3_result",
@@ -250,24 +339,41 @@ pub fn init_pipeline(init: &PipelineInit) -> (PipelineState, PipelineAction) {
         max_reworks: init.max_reworks,
         coder_model: init.coder_model.clone(),
         verifier_model: init.verifier_model.clone(),
+        explore_model: init.explore_model.clone(),
+        context_map_path: None,
         head_sha: None,
         last_verdict_path: None,
         escalation_reason: None,
         pr_number: None,
         history: Vec::new(),
     };
-    let action = PipelineAction::SpawnCoder {
-        attempt: 0,
-        feedback: None,
+    let (next_phase, action) = if init.with_explore {
+        let map_path = default_context_map_path(&init.fork_id);
+        (
+            PipelinePhase::ExploreRunning,
+            PipelineAction::SpawnExplore {
+                fork_id: init.fork_id.clone(),
+                context_map_path: map_path,
+                explore_model: init.explore_model.clone(),
+            },
+        )
+    } else {
+        (
+            PipelinePhase::CoderRunning,
+            PipelineAction::SpawnCoder {
+                attempt: 0,
+                feedback: None,
+            },
+        )
     };
     state.history.push(PipelineTransition {
         from: PipelinePhase::Init,
         event: "init".to_string(),
-        to: PipelinePhase::CoderRunning,
+        to: next_phase,
         action: action.label().to_string(),
         note: None,
     });
-    state.phase = PipelinePhase::CoderRunning;
+    state.phase = next_phase;
     (state, action)
 }
 
@@ -332,6 +438,42 @@ pub fn advance_pipeline(
     }
 
     let action: PipelineAction = match (from, &event) {
+        // --- 사전 경량 explore 종료 (fail-open: 실패/스톨해도 코더로 직행) ---
+        (
+            PipelinePhase::ExploreRunning,
+            PipelineEvent::ExploreExited {
+                exit_code,
+                context_map_path,
+                stalled,
+            },
+        ) => {
+            let note = if *exit_code == 0 && !*stalled {
+                if let Some(p) = context_map_path.as_ref().filter(|s| !s.trim().is_empty()) {
+                    state.context_map_path = Some(p.clone());
+                    Some(format!("context_map={p}"))
+                } else {
+                    Some("explore ok without context map".to_string())
+                }
+            } else if *stalled {
+                Some("explore scout stalled — fail-open to coder".to_string())
+            } else {
+                Some(format!("explore scout exit {exit_code} — fail-open to coder"))
+            };
+            let action = PipelineAction::SpawnCoder {
+                attempt: state.attempt,
+                feedback: None,
+            };
+            state.phase = PipelinePhase::CoderRunning;
+            state.history.push(PipelineTransition {
+                from,
+                event: event_label(&event).to_string(),
+                to: PipelinePhase::CoderRunning,
+                action: action.label().to_string(),
+                note,
+            });
+            action
+        }
+
         // --- coder 종료 ---
         (
             PipelinePhase::CoderRunning | PipelinePhase::ReworkPending,
@@ -653,6 +795,8 @@ mod tests {
             max_reworks: DEFAULT_MAX_REWORKS,
             coder_model: "codex-gpt5".to_string(),
             verifier_model: "glm-5.3".to_string(),
+            with_explore: false,
+            explore_model: None,
         }
     }
 
@@ -928,5 +1072,71 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&bad).unwrap()).unwrap();
         assert!(load_state(&dir, "fk_t1").is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // 7) Pre-Coder 경량 explore 단계 — 성공 시 context_map 주입, 실패 시 fail-open 코더 진행
+    #[test]
+    fn explore_phase_injects_context_map_and_fails_open() {
+        let mut cfg = init();
+        cfg.with_explore = true;
+        cfg.explore_model = Some("deepseek-v4.1-flash".to_string());
+        let (state, action) = init_pipeline(&cfg);
+        assert_eq!(state.phase, PipelinePhase::ExploreRunning);
+        assert!(matches!(
+            action,
+            PipelineAction::SpawnExplore {
+                ref context_map_path,
+                ..
+            } if context_map_path == ".herdr/context/fk_t1-map.md"
+        ));
+
+        // 성공 → context_map_path 저장 + CoderRunning 전이
+        let (next, next_action) = advance_pipeline(
+            state.clone(),
+            PipelineEvent::ExploreExited {
+                exit_code: 0,
+                context_map_path: Some(".herdr/context/fk_t1-map.md".to_string()),
+                stalled: false,
+            },
+        );
+        assert_eq!(next.phase, PipelinePhase::CoderRunning);
+        assert_eq!(
+            next.context_map_path.as_deref(),
+            Some(".herdr/context/fk_t1-map.md")
+        );
+        assert!(matches!(next_action, PipelineAction::SpawnCoder { attempt: 0, .. }));
+
+        // 실패/스톨 → 에스컬레이션 없이 fail-open으로 CoderRunning 전이
+        let (fallback, fb_action) = advance_pipeline(
+            state,
+            PipelineEvent::ExploreExited {
+                exit_code: 124,
+                context_map_path: None,
+                stalled: true,
+            },
+        );
+        assert_eq!(fallback.phase, PipelinePhase::CoderRunning);
+        assert_eq!(fallback.context_map_path, None);
+        assert!(matches!(fb_action, PipelineAction::SpawnCoder { attempt: 0, .. }));
+    }
+
+    // 8) 브리프 코드 앵커 판별 — 파일:줄번호 / Context Pack / 소스 파일 2건+
+    #[test]
+    fn brief_has_code_anchors_distinguishes_high_level_vs_anchored() {
+        let vague = "## Standards\n깔끔하게 구현\n## Spec\n홈 검색 UX를 개선한다.\n## Merge Danger\ndoor: two-way\nblast_radius: 홈 검색 화면\n";
+        assert!(!brief_has_code_anchors(vague));
+
+        let with_line_anchor = "## Spec\n`HomeCatalogView.vue:120-185` 의 검색 디바운스를 수정한다.\n";
+        assert!(brief_has_code_anchors(with_line_anchor));
+
+        let with_context_pack = "## Context Pack\n- 핵심 함수 위치 요약\n";
+        assert!(brief_has_code_anchors(with_context_pack));
+
+        let with_two_paths = "## Spec\n수정 대상: `src/views/HomeCatalogView.vue`, `src/composables/useSearch.ts`\n";
+        assert!(brief_has_code_anchors(with_two_paths));
+
+        // `.herdr/` 메타 파일 경로는 코드 앵커로 치지 않는다
+        let herdr_only = "## Spec\n브리프 `.herdr/briefs/a.md`와 `.herdr/verify/a.json` 참고\n";
+        assert!(!brief_has_code_anchors(herdr_only));
     }
 }

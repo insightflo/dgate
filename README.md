@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/dependencies-0_npm-2ea043?style=flat-square" alt="dependencies">
   <a href="#7-rust-v2-네이티브-cli--선택적-gpui-데스크톱-관제앱"><img src="https://img.shields.io/badge/Rust_v2_+_GPUI-~3.7ms_startup-dea584?style=flat-square" alt="Rust"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-0078d4?style=flat-square" alt="platform">
-  <a href="#7-rust-v2-네이티브-cli--선택적-gpui-데스크톱-관제앱"><img src="https://img.shields.io/badge/tests-458_Rust_%2B_10_installer-2ea043?style=flat-square" alt="tests"></a>
+  <a href="#7-rust-v2-네이티브-cli--선택적-gpui-데스크톱-관제앱"><img src="https://img.shields.io/badge/tests-462_Rust_%2B_10_installer-2ea043?style=flat-square" alt="tests"></a>
   <img src="https://img.shields.io/badge/node-%3E%3D22.6-339933?style=flat-square" alt="node">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-111827?style=flat-square" alt="license"></a>
 </p>
@@ -46,8 +46,8 @@
       SQLite(WAL) 위 EWMA Beta 사후확률로 태스크를 <code>sharp</code>(읽기전용 워커 직행, 리드 0턴)과 <code>split</code>(리드 승격)으로 자동 분기한다. 동일 조건 연속 오류 2회 시 강제 <code>split</code> 안전 폴백. 외부 npm 의존성 0개 — Rust 단일 워크스페이스.
     </td>
     <td width="50%" valign="top">
-      <h3>⚙️ 0토큰 Sublead 파이프라인 &amp; 기본 병렬</h3>
-      비겹침 독립 태스크가 2개 이상이면 기본값으로 격리 <code>git worktree</code> 병렬 실행한다. 웨이브 내부 전이(<code>coder → verifier → rework/g3 → READY_PR</code>)는 상주 LLM 없이 <code>dg pipeline run</code>(0토큰 상태머신)이 구동하고, 에스컬레이션 시에만 단발 LLM을 깨운다.
+      <h3>⚙️ 0토큰 Sublead 파이프라인 &amp; 경량 사전 탐색</h3>
+      비겹침 독립 태스크가 2개 이상이면 기본값으로 격리 <code>git worktree</code> 병렬 실행한다. 브리프에 <code>file:line</code> 앵커가 없으면 경량 읽기전용 <code>explore</code> 워커가 <code>.herdr/context/&lt;fork_id&gt;-map.md</code>를 먼저 생성해 중량 코더의 탐색 시간 낭비를 차단하고, 웨이브 내부 전이(<code>explore → coder → verifier → rework/g3 → READY_PR</code>)는 상주 LLM 없이 <code>dg pipeline run</code>(0토큰 상태머신)이 구동한다.
     </td>
   </tr>
   <tr>
@@ -142,7 +142,7 @@ npm run setup:check      # 읽기전용 진단 리포트만 (파일 쓰기 0)
 # 1) 오케스트레이션 계획 리허설 (모델 호출 0회, 실기동 0회 — 무조건 안전)
 ./target/release/dg dispatch --task-kind multi_edit --repo . --dry-run
 
-# 2) 전체 테스트 468건 — Rust 워크스페이스 458 + 설치 스크립트 10
+# 2) 전체 테스트 472건 — Rust 워크스페이스 462 + 설치 스크립트 10
 npm test                 # = cargo test --workspace && node --test tests/*.test.ts
 
 # 3) 데모 TUI 스냅샷 (DB·hc 없이 관제 화면 정적 출력)
@@ -281,7 +281,7 @@ dg <command> [flags]
 | `dispatch-mode` | `--set off\|strict` — strict: delegate_swarm wrap은 dispatch 발급 `--fork`만 허용 |
 | `send` | `<addr> <message…>` — hc send + 전달 확인·재전송, 미확인 exit 1 |
 | `reap` | `--minutes 30`·`--dry-run` — 종료 터미널 유휴 창 경과 후 자동 정리 (sublead 컨텍스트는 자기 하위 트리만 스코핑) |
-| `pipeline` | `init\|step\|status\|run [--dry-run]` — 0토큰 결정적 sublead 상태머신(`coder→verifier→rework/g3→READY_PR`, 에스컬레이션 `exit 3`) |
+| `pipeline` | `init\|step\|status\|run [--dry-run] [--with-explore\|--skip-explore]` — 0토큰 결정적 sublead 상태머신(`explore(자동/선택)→coder→verifier→rework/g3→READY_PR`, 에스컬레이션 `exit 3`) |
 | `merge-train` | 직렬 머지 트레인 — CI 재실행 확인 및 sublead 머지 차단 가드 |
 | `suggest-sublead` | `--project <dir>` 또는 `--scopes <p1,p2,...>` — 3축 신호 기반 sublead 분리·병렬 배치 추천 (LLM 0호출) |
 | `suggest-session` | `--role` · `--door` · `--files` · `--same-domain` · `--queued` · `--compacted` — 하이브리드 세션 수명 정책(`ephemeral` vs `warm_reuse` + 리셋 판정, LLM 0호출) |
@@ -408,10 +408,10 @@ cargo run -p dgate-gui -- [--repo <dir>] [--db <path>] [--roster <path>] [--watc
 
 | 대상 | 테스트 수 | 실행 명령 |
 | :--- | :--- | :--- |
-| **Rust 워크스페이스** | **458건** (`core` 325 · `cli` 32 · `e2e` 11 · `gui` 45 · `tui` 45) | `cargo test --workspace` |
+| **Rust 워크스페이스** | **462건** (`core` 327 · `cli` 34 · `e2e` 11 · `gui` 45 · `tui` 45) | `cargo test --workspace` |
 | **전역 설치 스크립트** | **10건** (래퍼 생성 · 멱등 · win32 계약) | `node --test tests/install-global.test.ts` |
 
-`npm test`로 468건 전수를 한 번에 실행합니다.
+`npm test`로 472건 전수를 한 번에 실행합니다.
 
 ---
 

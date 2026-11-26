@@ -97,6 +97,8 @@ description: Use when dispatching multi-CLI workers (pi/devin/agy via hc), runni
 
 **자동 병렬 기본값 (Default-On Parallel)**: 작업 착수 시 파일 수정 범위가 겹치지 않는 독립 작업이 **2개 이상**이면 사용자가 "병렬로 해줘"라고 명시하지 않아도 **기본값으로 격리 `git worktree` + 병렬 워커(`dg dispatch` + `dg wrap`/`dg pipeline run`)를 동시 기동**한다. 직렬 실행은 동일 파일 충돌이 확실하거나 선후 의존(`--after`)이 있는 경우에만 예외로 적용한다. 착수 직전 대상 경로/영역 목록이 2개 이상이면 `dg suggest-sublead --scopes <path1,path2,...>`를 호출해 비겹침 그룹 수와 추천 병렬 배치(워커/sublead 수·상한)를 확인한다(DB 없이 즉시 판정).
 
+**경량 사전 탐색(Pre-Coder Explore) 분업 계약**: 중량 코더(`glm-5.4 high`·`devin`·`codex` 등)가 코드베이스 탐색에 15~20분을 소진하지 않도록, 브리프에 `파일:줄번호` 앵커나 `## Context Pack`이 없으면 `dg pipeline init`이 자동으로 `ExploreRunning` 위상을 선행 활성화한다(`--with-explore` 강제 / `--skip-explore` 생략). 경량 읽기전용 `explore` 워커(`--tools read,grep,find,ls --exclude-tools edit,write`, 5분 상한, fail-open)가 `.herdr/context/<fork_id>-map.md`에 수정 대상 파일·줄번호·테스트 경로를 압축 기록하고, 코더 프롬프트에 자동 주입해 코더가 첫 턴부터 바로 구현에 착수하게 한다. `dg dispatch`도 쓰기 브리프에 코드 앵커가 없으면 `suggestExploreFirst: true`를 반환한다.
+
 1. **착수 전 브리핑 (`mistology`)** *(선택 — 설치된 경우에만 실행, 없으면 스킵)* — 코드 수정/디버깅 전, 해당 저장소에 `mistology`가 있으면 1회 조회:
    ```bash
    mistology search -b "<대상 파일·심볼·작업 의도>"

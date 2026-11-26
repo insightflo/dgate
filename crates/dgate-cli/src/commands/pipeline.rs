@@ -62,6 +62,29 @@ fn cmd_init(args: &ParsedArgs, json: bool) -> CmdResult {
     let verifier_model = optional_flag(args, "verifier-model")
         .or_else(|| std::env::var("HERDR_VERIFIER_MODEL").ok())
         .unwrap_or_default();
+    let explore_model = optional_flag(args, "explore-model")
+        .or_else(|| std::env::var("HERDR_EXPLORE_MODEL").ok())
+        .filter(|s| !s.trim().is_empty());
+
+    // 사전 경량 탐색(Pre-Coder Explore) 결정:
+    // `--skip-explore` → 끔, `--with-explore` → 켬, 미지정 시 브리프에 코드 앵커(파일:줄번호)가
+    // 없을 때만 자동 활성화해 중량 코더가 전체 레포 탐색에 시간을 태우는 사고를 예방한다.
+    let skip_explore = bool_flag(args, "skip-explore");
+    let force_explore = bool_flag(args, "with-explore");
+    let auto_explore = if skip_explore {
+        false
+    } else if force_explore {
+        true
+    } else {
+        std::fs::read_to_string(&brief)
+            .map(|text| !pipeline::brief_has_code_anchors(&text))
+            .unwrap_or(false)
+    };
+    if auto_explore && !force_explore {
+        crate::util::eprint_line(
+            "[dg pipeline] 브리프에 파일·줄번호 앵커 없음 — 경량 explore 사전 탐색 자동 활성화(--skip-explore로 생략 가능)",
+        );
+    }
 
     let (state, action) = pipeline::init_pipeline(&PipelineInit {
         fork_id: fork_id.clone(),
@@ -73,6 +96,8 @@ fn cmd_init(args: &ParsedArgs, json: bool) -> CmdResult {
         max_reworks: max_reworks as u32,
         coder_model,
         verifier_model,
+        with_explore: auto_explore,
+        explore_model,
     });
 
     let dir = state_dir(args);
@@ -137,6 +162,17 @@ fn cmd_step(args: &ParsedArgs, json: bool) -> CmdResult {
     let reason = optional_flag(args, "reason");
     let mut verdict_errors: Vec<String> = Vec::new();
     let event = match event_name.as_str() {
+        "explore-ok" => PipelineEvent::ExploreExited {
+            exit_code: 0,
+            context_map_path: optional_flag(args, "context-map")
+                .or_else(|| Some(pipeline::default_context_map_path(&state.fork_id))),
+            stalled: false,
+        },
+        "explore-fail" => PipelineEvent::ExploreExited {
+            exit_code: 1,
+            context_map_path: None,
+            stalled: bool_flag(args, "stalled"),
+        },
         "coder-ok" => PipelineEvent::CoderExited {
             exit_code: 0,
             head_sha: head.clone(),
@@ -184,7 +220,7 @@ fn cmd_step(args: &ParsedArgs, json: bool) -> CmdResult {
         },
         other => {
             return Err(DgError::Usage(UsageError(format!(
-                "invalid --event \"{other}\" (allowed: coder-ok|coder-fail|verdict|g3-pass|g3-fail)"
+                "invalid --event \"{other}\" (allowed: explore-ok|explore-fail|coder-ok|coder-fail|verdict|g3-pass|g3-fail)"
             ))))
         }
     };
@@ -298,6 +334,10 @@ pub const RUN_DEFAULT_MAX_STEPS: i64 = 20;
 /// 워커 `dg wrap` 스톨·최대 시간(관측된 코더 스폰 계약과 동일 값).
 const WRAP_STALL_MS: &str = "600000";
 const WRAP_MAX_MS: &str = "1500000";
+/// 경량 사전 탐색(explore) 워커는 빠르게 Context Pack만 뽑고 종료한다(최대 5분).
+const EXPLORE_STALL_MS: &str = "180000";
+const EXPLORE_MAX_MS: &str = "300000";
+const EXPLORE_READ_LINES: &str = "240";
 /// advisor 세션 화면 스캔 범위 — `[advisor:…]` 마커 검출용 `hc read` 꼬리 길이.
 const ADVISOR_READ_LINES: &str = "200";
 
@@ -375,6 +415,14 @@ fn sh_quote(s: &str) -> String {
 /// (전이 시 이미 계산된 액션을 재실행하는 것이지 새 판정이 아님 — 0토큰).
 fn action_for_phase(state: &PipelineState) -> Result<PipelineAction, String> {
     match state.phase {
+        PipelinePhase::ExploreRunning => Ok(PipelineAction::SpawnExplore {
+            fork_id: state.fork_id.clone(),
+            context_map_path: state
+                .context_map_path
+                .clone()
+                .unwrap_or_else(|| pipeline::default_context_map_path(&state.fork_id)),
+            explore_model: state.explore_model.clone(),
+        }),
         PipelinePhase::Init | PipelinePhase::CoderRunning | PipelinePhase::ReworkPending => {
             let last = state
                 .history
@@ -416,6 +464,60 @@ fn action_for_phase(state: &PipelineState) -> Result<PipelineAction, String> {
 
 // ---------- 워커 프롬프트·argv (dry-run 계획과 실제 실행이 같은 빌더를 공유) ----------
 
+fn explore_prompt(state: &PipelineState) -> String {
+    format!(
+        "읽기전용 사전 탐색(Context Pack 생성) — 브리프 {brief}의 요구사항을 구현하기 전에 \
+         중량 코더가 불필요한 전체 레포 탐색을 하지 않도록 아래 4가지만 간결한 Markdown으로 출력하라 \
+         (파일 수정·커밋 절대 금지): \
+         1) ## Target Anchors: 수정할 파일 경로와 정확한 줄번호 범위(`path:start-end`) 및 핵심 함수·컴포넌트명, \
+         2) ## Related Tests: 기존 테스트 파일 경로와 실행 명령, \
+         3) ## Constraints & Edge Cases: 놓치기 쉬운 타입·상태·호출부 제약, \
+         4) ## Minimal Plan: 3~5줄 구현 순서 요약.",
+        brief = state.brief_path,
+    )
+}
+
+/// 경량 읽기전용 사전 탐색 워커 내부 argv — 로스터 `explore` 슬롯(기본 pi read-only)을 쓰되
+/// `--tools read,grep,find,ls --exclude-tools edit,write`로 쓰기를 물리 차단한다.
+fn explore_inner_argv(cfg: &ExecConfig, state: &PipelineState) -> Vec<String> {
+    let prompt = explore_prompt(state);
+    let loaded = roster::load_roster_config_quiet(None, Some(&cfg.repo_dir));
+    let (_name, profile, _fb) =
+        roster::resolve_roster_profile(&loaded.config, &loaded.config.default_profile);
+    let model = state.explore_model.clone().or_else(|| {
+        profile
+            .roles
+            .get(&roster::RoleSlot::Explore)
+            .and_then(|s| s.model.clone())
+    });
+    let mut a = vec![
+        roster::resolve_worker_bin(roster::WorkerCliKind::Pi, None),
+        "--provider".to_string(),
+        "opencodex".to_string(),
+    ];
+    if let Some(m) = model.filter(|m| !m.trim().is_empty()) {
+        a.push("--model".to_string());
+        a.push(m);
+    }
+    a.extend(
+        [
+            "--tools",
+            "read,grep,find,ls",
+            "--exclude-tools",
+            "edit,write",
+            "--no-session",
+            "--no-extensions",
+            "--no-mcp",
+            "--no-skills",
+            "-p",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    a.push(prompt);
+    a
+}
+
 fn coder_prompt(
     state: &PipelineState,
     attempt: u32,
@@ -428,6 +530,11 @@ fn coder_prompt(
          완료 시 변경 요약을 최종 메시지로 출력하라",
         state.brief_path
     );
+    if let Some(cm) = state.context_map_path.as_deref().filter(|s| !s.trim().is_empty()) {
+        p.push_str(&format!(
+            " — 사전 탐색 Context Pack({cm})을 먼저 읽고 기록된 파일·줄번호 앵커부터 바로 구현에 착수하라(불필요한 전체 레포 재탐색 금지)"
+        ));
+    }
     if let Some(vp) = verdict_path {
         p.push_str(&format!(" — 이전 검증 verdict {vp} 의 finding을 모두 해소하라"));
     }
@@ -713,6 +820,30 @@ fn plan_commands(
 ) -> Vec<Vec<String>> {
     let cwd = worker_cwd(cfg, state);
     match action {
+        PipelineAction::SpawnExplore { fork_id, .. } => {
+            let sess = session_name("explore", fork_id, None);
+            let inner = explore_inner_argv(cfg, state);
+            let mut spawn = wrap_spawn_argv(cfg, &sess, "explore", "file_read", None, None, &inner);
+            for i in 0..spawn.len().saturating_sub(1) {
+                if spawn[i] == "--stall-ms" {
+                    spawn[i + 1] = EXPLORE_STALL_MS.to_string();
+                } else if spawn[i] == "--max-ms" {
+                    spawn[i + 1] = EXPLORE_MAX_MS.to_string();
+                }
+            }
+            vec![
+                hc_run_argv(cfg, &sess, &cwd, &spawn),
+                vec![cfg.hc_bin.clone(), "wait".to_string(), sess.clone(), "--json".to_string()],
+                vec![
+                    cfg.hc_bin.clone(),
+                    "read".to_string(),
+                    sess.clone(),
+                    "--lines".to_string(),
+                    EXPLORE_READ_LINES.to_string(),
+                ],
+                vec![cfg.hc_bin.clone(), "rm".to_string(), sess],
+            ]
+        }
         PipelineAction::SpawnCoder { attempt, feedback } => {
             coder_commands(cfg, state, *attempt, feedback.as_deref(), None)
         }
@@ -987,6 +1118,73 @@ impl RealPipelineExecutor {
         Self { cfg }
     }
 
+    /// 경량 읽기전용 explore 세션 실행 → 출력 캡처 → `.herdr/context/<fork_id>-map.md` 저장 → ExploreExited.
+    /// 탐색이 실패하거나 스톨해도 fail-open으로 ExploreExited를 반환해 코더 진행을 막지 않는다.
+    fn run_explore(
+        &self,
+        state: &PipelineState,
+        context_map_path: &str,
+    ) -> Result<Option<PipelineEvent>, String> {
+        let sess = session_name("explore", &state.fork_id, None);
+        let cwd = worker_cwd(&self.cfg, state);
+        let inner = explore_inner_argv(&self.cfg, state);
+        let mut argv = wrap_spawn_argv(&self.cfg, &sess, "explore", "file_read", None, None, &inner);
+        for i in 0..argv.len().saturating_sub(1) {
+            if argv[i] == "--stall-ms" {
+                argv[i + 1] = EXPLORE_STALL_MS.to_string();
+            } else if argv[i] == "--max-ms" {
+                argv[i + 1] = EXPLORE_MAX_MS.to_string();
+            }
+        }
+        let info = match hc_run_to_exit(&self.cfg.hc_bin, &sess, &cwd, &argv) {
+            Ok(i) => i,
+            Err(e) => {
+                eprint_line(&format!("[pipeline run] explore 스폰/대기 실패(fail-open): {e}"));
+                hc_rm(&self.cfg.hc_bin, &sess);
+                return Ok(Some(PipelineEvent::ExploreExited {
+                    exit_code: 1,
+                    context_map_path: None,
+                    stalled: false,
+                }));
+            }
+        };
+        let exit_code = session_exit_code(&info);
+        let screen = hc_read(&self.cfg.hc_bin, &sess, EXPLORE_READ_LINES);
+        let stalled = screen.contains("\"stalled\":true") || screen.contains("\"stalled\": true");
+        hc_rm(&self.cfg.hc_bin, &sess);
+
+        let saved_path = if exit_code == 0 && !stalled && !screen.trim().is_empty() {
+            let full_path = if Path::new(context_map_path).is_absolute() {
+                PathBuf::from(context_map_path)
+            } else {
+                cwd.join(context_map_path)
+            };
+            if let Some(parent) = full_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let header = format!(
+                "# Context Pack — {} (auto-generated by lightweight explore scout)\n\n",
+                state.fork_id
+            );
+            let content = format!("{header}{}\n", screen.trim());
+            match std::fs::write(&full_path, content) {
+                Ok(()) => Some(context_map_path.to_string()),
+                Err(e) => {
+                    eprint_line(&format!("[pipeline run] context map 저장 실패(fail-open): {e}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Some(PipelineEvent::ExploreExited {
+            exit_code,
+            context_map_path: saved_path,
+            stalled,
+        }))
+    }
+
     /// coder 세션 실행 → CoderExited. 세션명은 attempt와 결속해 재스폰을 구분한다.
     fn run_coder(
         &self,
@@ -1146,6 +1344,9 @@ impl PipelineExecutor for RealPipelineExecutor {
         state: &PipelineState,
     ) -> Result<Option<PipelineEvent>, String> {
         match action {
+            PipelineAction::SpawnExplore {
+                context_map_path, ..
+            } => self.run_explore(state, context_map_path),
             PipelineAction::SpawnCoder { attempt, feedback } => {
                 self.run_coder(state, *attempt, feedback.as_deref(), None)
             }
@@ -1421,6 +1622,8 @@ mod run_tests {
             max_reworks,
             coder_model: "codex-gpt5".to_string(),
             verifier_model: "glm-5.3".to_string(),
+            with_explore: false,
+            explore_model: None,
         })
         .0
     }
@@ -1674,5 +1877,39 @@ mod run_tests {
         assert_eq!(cmd_escape_token("a\"b"), "a\"b");
         assert_eq!(cmd_escape_token(""), "");
         assert_eq!(cmd_escape_token("glm-zcode/glm-5.3"), "glm-zcode/glm-5.3");
+    }
+
+    #[test]
+    fn explore_commands_are_readonly_and_coder_prompt_injects_context_map() {
+        let (mut state, action) = pipeline::init_pipeline(&PipelineInit {
+            fork_id: "fk_exp1".to_string(),
+            run_id: None,
+            brief_path: ".herdr/briefs/ux.md".to_string(),
+            worktree_path: Some("/tmp/wt-ux".to_string()),
+            branch: "feat/ux".to_string(),
+            scope_glob: None,
+            max_reworks: 2,
+            coder_model: "glm-5.4".to_string(),
+            verifier_model: "deepseek-v4.1-flash".to_string(),
+            with_explore: true,
+            explore_model: Some("deepseek-v4.1-flash".to_string()),
+        });
+        assert_eq!(state.phase, PipelinePhase::ExploreRunning);
+        let cfg = ExecConfig {
+            hc_bin: "hc".to_string(),
+            dg_bin: "dg".to_string(),
+            repo_dir: PathBuf::from("/tmp/repo"),
+        };
+        let cmds = plan_commands(&action, &state, &cfg);
+        assert_eq!(cmds.len(), 4);
+        let joined = cmds[0].join(" ");
+        assert!(joined.contains("--tools") && joined.contains("read,grep,find,ls"));
+        assert!(joined.contains("--exclude-tools") && joined.contains("edit,write"));
+        assert!(joined.contains("--max-ms 300000"));
+
+        state.context_map_path = Some(".herdr/context/fk_exp1-map.md".to_string());
+        let cp = coder_prompt(&state, 0, None, None);
+        assert!(cp.contains(".herdr/context/fk_exp1-map.md"));
+        assert!(cp.contains("파일·줄번호 앵커"));
     }
 }
