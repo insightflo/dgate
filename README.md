@@ -27,9 +27,10 @@
 
 <!-- gitreels:start -->
 <p align="center">
-  <a href="https://gitreels.com/insightflo/dgate"><img src="https://gitreels.com/insightflo/dgate.webp" alt="insightflo/dgate in 15 seconds" width="100%"></a>
+  <a href="https://gitreels.com/insightflo/dgate"><img src="https://gitreels.com/insightflo/dgate.webp?lang=ko" alt="insightflo/dgate in 15 seconds" width="100%"></a>
   <br>
   <a href="https://gitreels.com"><img src="https://gitreels.com/badge.svg" alt="Made with GitReels" height="24"></a>
+  <a href="https://gitreels.com/insightflo/dgate"><img src="https://gitreels.com/api/badges/rotw/insightflo/dgate.svg" alt="Reel of the Week #1 on GitReels" height="24"></a>
 </p>
 <!-- gitreels:end -->
 
