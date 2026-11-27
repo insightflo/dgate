@@ -102,6 +102,8 @@ pub struct HcTerminalDetail {
     pub argv: Option<Vec<String>>,
     /// 현재 터미널 포그라운드 프로세스 argv — 있으면 초기 셸 런치 argv보다 우선.
     pub foreground_argv: Option<Vec<String>>,
+    /// 현재 터미널 포그라운드 프로세스 cwd — `cd <other_repo> && agy`처럼 셸 초기 cwd와 다를 때 우선.
+    pub foreground_cwd: Option<String>,
 }
 
 impl HcTerminalDetail {
@@ -116,6 +118,7 @@ impl HcTerminalDetail {
             cwd: s.cwd.clone(),
             argv: None,
             foreground_argv: None,
+            foreground_cwd: None,
         }
     }
 }
@@ -518,6 +521,49 @@ fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
 /// 워커 cwd가 `--repo <dir>` 스코프 안에 있는지 판정.
 /// 필터 없음(None)이면 전역 관측(항상 true), 워커 cwd 미상이면 스코프 지정 시 false.
 /// 워크트리 서브디렉터리(`.herdr/worktrees/…`)도 소속 레포 스코프에 포함된다.
+/// 경로가 연결된 git worktree 내부라면 `.git` 파일(`gitdir: <main>/.git/worktrees/<name>`)을
+/// 순수 파일 읽기로 추적해 원본 메인 저장소 루트 경로를 반환한다(외부 `git` 프로세스 스폰 0회).
+fn resolve_linked_worktree_main_repo(path: &Path) -> Option<PathBuf> {
+    let mut cur = path.to_path_buf();
+    for _ in 0..8 {
+        let dot_git = cur.join(".git");
+        if dot_git.is_dir() {
+            return None; // 일반 메인 저장소 — 워크트리 아님
+        }
+        if dot_git.is_file() {
+            let content = std::fs::read_to_string(&dot_git).ok()?;
+            let gitdir_raw = content
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("gitdir:"))?
+                .trim();
+            if gitdir_raw.is_empty() {
+                return None;
+            }
+            let gitdir_path = if Path::new(gitdir_raw).is_absolute() {
+                PathBuf::from(gitdir_raw)
+            } else {
+                cur.join(gitdir_raw)
+            };
+            let normalized = strip_verbatim_prefix(resolve_path_best(
+                gitdir_path.to_str().unwrap_or(gitdir_raw),
+            ));
+            // `<main_repo>/.git/worktrees/<wt_name>` → `<main_repo>` 추출
+            let mut ancestor = normalized.as_path();
+            while let Some(parent) = ancestor.parent() {
+                if ancestor.file_name().and_then(|n| n.to_str()) == Some(".git") {
+                    return Some(parent.to_path_buf());
+                }
+                ancestor = parent;
+            }
+            return None;
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    None
+}
+
 pub fn matches_repo_scope(worker_cwd: Option<&str>, repo_filter_dir: Option<&str>) -> bool {
     let Some(filter) = repo_filter_dir.map(str::trim).filter(|s| !s.is_empty()) else {
         return true;
@@ -529,7 +575,18 @@ pub fn matches_repo_scope(worker_cwd: Option<&str>, repo_filter_dir: Option<&str
     let scope_path = strip_verbatim_prefix(resolve_path_best(filter));
     // 컴포넌트 단위 접두 — `/repo2/x`가 `/repo` 스코프에 잘못 포함되지 않고,
     // 루트 스코프('/' 또는 'C:\')는 그 하위 전부를 포함한다(구분자 더블링 사고 없음).
-    worker_path.starts_with(&scope_path)
+    if worker_path.starts_with(&scope_path) {
+        return true;
+    }
+    // 레포 바깥 형제 디렉터리(`.worktrees/<repo>/...`, `../<repo>-worktrees/...`)에 만든
+    // 연결 git worktree도 `.git` 파일의 `gitdir:`이 같은 메인 저장소를 가리키면 스코프에 포함한다.
+    let scope_main = resolve_linked_worktree_main_repo(&scope_path).unwrap_or(scope_path);
+    if let Some(worker_main) = resolve_linked_worktree_main_repo(&worker_path) {
+        if worker_main.starts_with(&scope_main) || scope_main.starts_with(&worker_main) {
+            return worker_main == scope_main;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -2474,9 +2531,8 @@ fn parse_hc_get_json(raw: &str) -> Option<HcTerminalDetail> {
             .map(str::to_string)
             .collect::<Vec<String>>()
     });
-    let foreground_argv = obj
-        .get("foreground")
-        .and_then(Value::as_object)
+    let foreground_obj = obj.get("foreground").and_then(Value::as_object);
+    let foreground_argv = foreground_obj
         .and_then(|fg| fg.get("argv"))
         .and_then(Value::as_array)
         .map(|arr| {
@@ -2485,11 +2541,20 @@ fn parse_hc_get_json(raw: &str) -> Option<HcTerminalDetail> {
                 .map(str::to_string)
                 .collect::<Vec<String>>()
         });
-    Some(HcTerminalDetail {
-        argv,
-        foreground_argv,
-        ..HcTerminalDetail::from_summary(&summary)
-    })
+    let foreground_cwd = foreground_obj
+        .and_then(|fg| fg.get("cwd"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mut detail = HcTerminalDetail::from_summary(&summary);
+    detail.argv = argv;
+    detail.foreground_argv = foreground_argv;
+    if let Some(ref fg_cwd) = foreground_cwd {
+        detail.cwd = Some(fg_cwd.clone());
+    }
+    detail.foreground_cwd = foreground_cwd;
+    Some(detail)
 }
 
 // ---------------------------------------------------------------------------
@@ -2622,15 +2687,17 @@ impl LiveSyncSnapshotter {
             .exec(&self.hc_bin, &["ls", "--json"], HC_LS_TIMEOUT_MS)
             .ok()
             .and_then(|raw| parse_hc_ls_json(&raw));
+        let repo_scope_str = self.repo_filter_dir.as_deref().and_then(|p| p.to_str());
         let summaries: Option<Vec<HcTerminalSummary>> = all_terminals.as_ref().map(|terminals| {
             terminals
                 .iter()
                 .filter(|t| {
-                    is_observable_terminal(t)
-                        && matches_repo_scope(
-                            t.cwd.as_deref(),
-                            self.repo_filter_dir.as_deref().and_then(|p| p.to_str()),
-                        )
+                    if !is_observable_terminal(t) {
+                        return false;
+                    }
+                    // 셸 초기 cwd가 달라도 활성 에이전트(`status.is_some()`)는 `hc get`의
+                    // `foreground.cwd`로 재판정하기 위해 후보에 남겨둔다.
+                    matches_repo_scope(t.cwd.as_deref(), repo_scope_str) || t.status.is_some()
                 })
                 .cloned()
                 .collect()
@@ -2671,9 +2738,18 @@ impl LiveSyncSnapshotter {
                 detail.parent = summary.parent.clone().or(detail.parent);
                 detail.state = summary.state.clone().or(detail.state);
                 detail.status = summary.status.clone().or(detail.status);
-                detail.cwd = summary.cwd.clone().or(detail.cwd);
+                detail.cwd = detail
+                    .foreground_cwd
+                    .clone()
+                    .or_else(|| summary.cwd.clone())
+                    .or(detail.cwd);
                 self.detail_cache
                     .insert(summary.address.clone(), detail.clone());
+
+                // `foreground.cwd` 반영 후 최종 레포 스코프 판정 — 다른 레포의 활성 에이전트는 제외.
+                if !matches_repo_scope(detail.cwd.as_deref(), repo_scope_str) {
+                    continue;
+                }
 
                 // 이중 카드 방지 — 터미널(포그라운드·런치 argv)이 `dg wrap`을 호스팅하면
                 // §3.5 ps wrap 탐지가 같은 워커를 정확히 표시하므로 hc 카드는 만들지
@@ -3454,6 +3530,7 @@ mod tests {
             cwd: cwd.map(str::to_string),
             argv: Some(argv.iter().map(|s| s.to_string()).collect()),
             foreground_argv: None,
+            foreground_cwd: None,
         }
     }
 
@@ -4965,6 +5042,70 @@ mod tests {
             merged.workers
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn matches_repo_scope_includes_external_linked_git_worktrees() {
+        let base = temp_dir("linked-wt-scope");
+        let main_repo = base.join("peers_bridge");
+        let other_repo = base.join("other_repo");
+        let ext_wt = base.join(".worktrees").join("peers_bridge").join("track-a");
+        let ext_wt_sub = ext_wt.join("src").join("server");
+        let other_wt = base.join(".worktrees").join("other_repo").join("w1");
+
+        std::fs::create_dir_all(main_repo.join(".git").join("worktrees").join("track-a")).unwrap();
+        std::fs::create_dir_all(other_repo.join(".git").join("worktrees").join("w1")).unwrap();
+        std::fs::create_dir_all(&ext_wt_sub).unwrap();
+        std::fs::create_dir_all(&other_wt).unwrap();
+
+        std::fs::write(
+            ext_wt.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                main_repo.join(".git").join("worktrees").join("track-a").display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            other_wt.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                other_repo.join(".git").join("worktrees").join("w1").display()
+            ),
+        )
+        .unwrap();
+
+        let scope = main_repo.to_str().unwrap();
+        assert!(matches_repo_scope(ext_wt.to_str(), Some(scope)));
+        assert!(matches_repo_scope(ext_wt_sub.to_str(), Some(scope)));
+        assert!(!matches_repo_scope(other_wt.to_str(), Some(scope)));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn parse_hc_get_json_prefers_foreground_cwd_over_shell_cwd() {
+        let raw = r#"{
+            "address": "t4kw",
+            "agent": "antigravity",
+            "cwd": "/Users/kwak/Projects/skills/dgate",
+            "state": "live",
+            "status": {"app": "antigravity", "state": "working"},
+            "argv": ["/bin/zsh", "-l"],
+            "foreground": {
+                "argv": ["agy", "--dangerously-skip-permissions"],
+                "cwd": "/Users/kwak/Projects/skills/peers_bridge",
+                "pid": 38121
+            }
+        }"#;
+        let detail = parse_hc_get_json(raw).expect("valid hc get json");
+        assert_eq!(
+            detail.foreground_cwd.as_deref(),
+            Some("/Users/kwak/Projects/skills/peers_bridge")
+        );
+        assert_eq!(
+            detail.cwd.as_deref(),
+            Some("/Users/kwak/Projects/skills/peers_bridge")
+        );
     }
 
 }
